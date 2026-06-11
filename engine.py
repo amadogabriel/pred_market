@@ -24,6 +24,7 @@ from pm.core import db
 from pm.core.books import BookStore
 from pm.core.bus import Bus
 from pm.execution.fee_engine import FeeEngine
+from pm.execution.task import execution_task
 from pm.ingestion.event_logger import event_logger_task
 from pm.ingestion.metadata_sync import metadata_sync_loop
 from pm.ingestion.rest_recon import recon_task
@@ -76,6 +77,8 @@ async def main() -> None:
                            name="rest_recon")
             tg.create_task(scan_task(bus, conn, books, fee_engine, settings, neg_risk_groups),
                            name="scan")
+            tg.create_task(execution_task(bus, conn, settings, hard_live_gate=LIVE_TRADING),
+                           name="execution")
             tg.create_task(heartbeat_task(conn, settings),
                            name="heartbeat")
     finally:

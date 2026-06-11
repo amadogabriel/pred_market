@@ -197,7 +197,10 @@ def check_monitor_stale_alert(timeout_s: float) -> CheckResult:
     return CheckResult("monitor stale alert", "OK", "stale heartbeat alert printed in dev fallback mode")
 
 
-def check_soak_marker(marker: Path, required_hours: float, start_soak: bool) -> CheckResult:
+def check_soak_marker(marker: Path, required_hours: float, start_soak: bool,
+                      reset_soak: bool) -> CheckResult:
+    if reset_soak and marker.exists():
+        marker.unlink()
     if start_soak and not marker.exists():
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(json.dumps({
@@ -283,6 +286,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--fee-audit-csv", type=Path, default=ROOT / "data" / "g0_fee_audit.csv")
     parser.add_argument("--soak-marker", type=Path, default=ROOT / "data" / "g0_soak_start.json")
     parser.add_argument("--start-soak", action="store_true")
+    parser.add_argument("--reset-soak", action="store_true",
+                        help="Overwrite the soak marker; use after any manual engine restart.")
     parser.add_argument("--required-soak-hours", type=float, default=168.0)
     parser.add_argument("--max-recon-diff", type=float, default=0.01)
     parser.add_argument("--recent-hours", type=float, default=1.0)
@@ -319,7 +324,8 @@ def main(argv: list[str] | None = None) -> int:
 
     results.append(check_event_logs(args.events_dir, args.max_event_age))
     results.append(check_monitor_stale_alert(args.monitor_timeout))
-    results.append(check_soak_marker(args.soak_marker, args.required_soak_hours, args.start_soak))
+    results.append(check_soak_marker(
+        args.soak_marker, args.required_soak_hours, args.start_soak, args.reset_soak))
     results.append(check_fee_audit(args.fee_audit_csv, args.fees))
     results.append(reconnect_drill_status())
 

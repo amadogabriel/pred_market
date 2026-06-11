@@ -14,9 +14,10 @@ T_TRADE = "last_trade_price"
 T_TICK = "tick_size_change"
 T_MARKET_EVT = "market_event"    # new_market / market_resolved / best_bid_ask
 T_SIGNAL = "signal"
+T_EXECUTION = "execution"        # execution intents, risk decisions, fills
 T_SYSTEM = "system"              # connects, disconnects, recon results, errors
 
-ALL_TOPICS = (T_BOOK, T_PRICE_CHANGE, T_TRADE, T_TICK, T_MARKET_EVT, T_SIGNAL, T_SYSTEM)
+ALL_TOPICS = (T_BOOK, T_PRICE_CHANGE, T_TRADE, T_TICK, T_MARKET_EVT, T_SIGNAL, T_EXECUTION, T_SYSTEM)
 
 
 @dataclass

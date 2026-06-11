@@ -12,11 +12,11 @@ import asyncio
 import logging
 from collections import defaultdict
 
-from pm.core.events import Event, T_SIGNAL, T_SYSTEM
+from pm.core.events import Event, T_EXECUTION, T_SIGNAL, T_SYSTEM
 
 log = logging.getLogger(__name__)
 
-LOSSLESS_TOPICS = {T_SIGNAL, T_SYSTEM}
+LOSSLESS_TOPICS = {T_SIGNAL, T_EXECUTION, T_SYSTEM}
 
 
 class Bus:

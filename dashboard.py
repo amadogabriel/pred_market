@@ -73,6 +73,10 @@ def query_state(conn, settings) -> dict:
             "SELECT COUNT(*) FROM (SELECT neg_risk_id FROM markets "
             "WHERE neg_risk_id IS NOT NULL GROUP BY neg_risk_id HAVING COUNT(*)>1)"),
         "signals": scalar("SELECT COUNT(*) FROM signal_log"),
+        "execution_intents": scalar("SELECT COUNT(*) FROM execution_intents"),
+        "fills": scalar("SELECT COUNT(*) FROM execution_fills"),
+        "risk_events": scalar("SELECT COUNT(*) FROM risk_events"),
+        "positions": scalar("SELECT COUNT(*) FROM positions WHERE ABS(size)>0"),
         "recon_rows": scalar("SELECT COUNT(*) FROM recon_log"),
         "rules_versions": scalar("SELECT COUNT(*) FROM rules_text"),
     }
@@ -99,6 +103,11 @@ def query_state(conn, settings) -> dict:
         "SELECT signal_id, kind, group_id, net_edge, exec_sets, ts FROM signal_log "
         "ORDER BY ts DESC LIMIT 15")]
 
+    # recent execution decisions
+    execution = [dict(r) for r in conn.execute(
+        "SELECT intent_id, signal_id, kind, side, token_id, price, size, notional, "
+        "status, reason, updated_at FROM execution_intents ORDER BY updated_at DESC LIMIT 15")]
+
     # top tracked markets by liquidity
     top_markets = [dict(r) for r in conn.execute(
         "SELECT question, category, liquidity, neg_risk FROM markets "
@@ -112,6 +121,7 @@ def query_state(conn, settings) -> dict:
         "recon": recon,
         "categories": categories,
         "signals": signals,
+        "execution": execution,
         "top_markets": top_markets,
         "event_log": _event_log_status(settings),
     }
@@ -207,6 +217,10 @@ INDEX_HTML = """<!DOCTYPE html>
     <div id="signals"></div>
   </section>
   <section>
+    <h2>Recent execution</h2>
+    <div id="execution"></div>
+  </section>
+  <section>
     <h2>Top tracked markets by liquidity</h2>
     <div id="markets"></div>
   </section>
@@ -232,6 +246,8 @@ async function refresh() {
     card("Markets", s.counts.markets.toLocaleString()) +
     card("NegRisk groups", s.counts.neg_risk_groups.toLocaleString()) +
     card("Signals fired", s.counts.signals.toLocaleString()) +
+    card("Exec intents", s.counts.execution_intents.toLocaleString()) +
+    card("Risk events", s.counts.risk_events.toLocaleString()) +
     card("Recon rows", s.counts.recon_rows.toLocaleString()) +
     card("Engine HB", (hb.stale ? '<span class="err">stale</span>' : "live"), fmtAge(hb.age_s)) +
     card("Event log", el.exists ? el.size_mb + " MB" : '<span class="err">none</span>',
@@ -265,6 +281,18 @@ async function refresh() {
       <td class="num">${g.net_edge.toFixed(4)}</td><td class="num">${g.exec_sets.toFixed(1)}</td>
       <td class="num">${fmtAge(s.now - g.ts)}</td></tr>`).join("") + `</table>`
     : '<div class="empty">no signals fired yet — expected when no arb exists (system is signal-only)</div>';
+
+  $("execution").innerHTML = s.execution.length ?
+    `<table><tr><th>id</th><th>signal</th><th>kind</th><th>side</th>
+       <th class="num">price</th><th class="num">size</th><th class="num">notional</th>
+       <th>status</th><th>reason</th></tr>` +
+    s.execution.map(e => `<tr><td>${e.intent_id}</td><td>${e.signal_id ?? ""}</td>
+      <td>${esc(e.kind)}</td><td>${esc(e.side)}</td>
+      <td class="num">${Number(e.price).toFixed(4)}</td>
+      <td class="num">${Number(e.size).toFixed(1)}</td>
+      <td class="num">${fmtUsd(e.notional)}</td>
+      <td>${esc(e.status)}</td><td>${esc((e.reason||"").slice(0,60))}</td></tr>`).join("") + `</table>`
+    : '<div class="empty">execution disabled or no signal has passed into execution yet</div>';
 
   $("markets").innerHTML = s.top_markets.length ?
     `<table><tr><th>question</th><th>category</th><th>negrisk</th><th class="num">liquidity</th></tr>` +

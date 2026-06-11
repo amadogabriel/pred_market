@@ -37,6 +37,12 @@ The script validates:
 .\.venv\Scripts\python.exe scripts\g0_gate.py --start-soak
 ```
 
+After any manual engine restart, reset the marker:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\g0_gate.py --reset-soak --start-soak
+```
+
 - WS reconnect drill on the Linux VPS. The requested `iptables` drop test is a
   production-network drill and should not be run from this Windows desktop.
 - 20 hand-checked fee examples from the Polymarket UI. Put them in

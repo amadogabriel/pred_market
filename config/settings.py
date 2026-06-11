@@ -16,6 +16,10 @@ def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
+def _env_bool(name: str, default: str = "false") -> bool:
+    return _env(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Settings:
     # --- paths ---
@@ -46,6 +50,21 @@ class Settings:
     # --- struct arb (signal-only in Phase 0/1) ---
     arb_buffer: float = field(default_factory=lambda: float(_env("PM_ARB_BUFFER", "0.01")))  # 1% safety buffer
     arb_min_set_size: float = field(default_factory=lambda: float(_env("PM_ARB_MIN_SETS", "10")))  # min executable sets
+
+    # --- execution / risk gates (Phase 1+, default closed) ---
+    execution_enabled: bool = field(default_factory=lambda: _env_bool("PM_EXECUTION_ENABLED", "false"))
+    execution_mode: str = field(default_factory=lambda: _env("PM_EXECUTION_MODE", "dry_run"))  # dry_run | live
+    live_trading: bool = field(default_factory=lambda: _env_bool("PM_LIVE_TRADING", "false"))
+    max_order_notional: float = field(default_factory=lambda: float(_env("PM_MAX_ORDER_NOTIONAL", "25")))
+    max_signal_notional: float = field(default_factory=lambda: float(_env("PM_MAX_SIGNAL_NOTIONAL", "100")))
+    max_open_notional: float = field(default_factory=lambda: float(_env("PM_MAX_OPEN_NOTIONAL", "250")))
+    max_daily_loss: float = field(default_factory=lambda: float(_env("PM_MAX_DAILY_LOSS", "50")))
+    max_recon_diff_for_execution: float = field(default_factory=lambda: float(_env("PM_MAX_RECON_DIFF_EXEC", "0.01")))
+    allow_unverified_negrisk: bool = field(default_factory=lambda: _env_bool("PM_ALLOW_UNVERIFIED_NEGRISK", "false"))
+    verified_groups_path: Path = field(default_factory=lambda: Path(
+        _env("PM_VERIFIED_GROUPS", str(ROOT / "config" / "verified_negrisk_groups.txt"))))
+    kill_switch_path: Path = field(default_factory=lambda: Path(
+        _env("PM_KILL_SWITCH", str(ROOT / "data" / "KILL_SWITCH"))))
 
     # --- telegram (monitor process) ---
     telegram_token: str = field(default_factory=lambda: _env("PM_TG_TOKEN", ""))

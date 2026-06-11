@@ -1,0 +1,4 @@
+# One verified NegRisk group id per line.
+#
+# Keep this empty until G0 passes and each group has been manually reviewed for
+# exhaustiveness against Polymarket's live UI and rules text.
