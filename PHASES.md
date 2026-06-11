@@ -18,6 +18,26 @@ Gate G0 still requires the items in `G0_STATUS.md`: seven-day soak, VPS
 reconnect drill, fee audit, clean recon, event-log validation, and monitor
 stale-alert verification.
 
+## Phase 0.5: Research Signals + Outcome Labeling
+
+Status: implemented (signal capture only; never executable).
+
+- S2 microstructure (`pm/signals/microstructure.py`): ofi_pressure,
+  liquidity_shock, trade_through
+- S3 relative value (`pm/signals/relative_value.py`): partition_sum_drift
+  (with mover/laggard attribution), complement_drift
+- Outcome labeler (`pm/signals/labeler.py`): fills signal_log.outcome/pnl
+  with forward mid returns after PM_LABEL_HORIZON
+- Offline replay harness (`scripts/replay_signals.py`): re-runs the scanners
+  over the JSONL event log with event-time clocks and evaluates forward
+  returns from the log itself — threshold tuning without live soak
+
+Isolation guarantees: research signals carry exec_sets=0 (empty execution
+plan by construction) AND their strategies are absent from
+PM_EXECUTION_STRATEGIES, so the execution task drops them before any risk
+machinery runs. Promotion path: sustained positive labeled outcomes →
+review → add strategy to the allowlist (Phase 1 gates still apply).
+
 ## Phase 1: Controlled Execution
 
 Status: scaffolding implemented, disabled by default.

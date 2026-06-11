@@ -57,6 +57,11 @@ async def _handle_signal_event(bus: Bus, conn, settings: Settings, broker,
     signal_id = event.payload.get("signal_id")
     if signal_id is None:
         return
+    # Research strategies (microstructure, rel_value, ...) are observational by
+    # contract — they never form plans, so skip them before any DB/risk work.
+    strategy = event.payload.get("strategy")
+    if strategy is not None and strategy not in settings.execution_strategies:
+        return
     signal = db.get_signal(conn, int(signal_id))
     if signal is None:
         db.log_risk_event(conn, code="signal_missing",

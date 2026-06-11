@@ -100,8 +100,16 @@ def query_state(conn, settings) -> dict:
 
     # recent signals
     signals = [dict(r) for r in conn.execute(
-        "SELECT signal_id, kind, group_id, net_edge, exec_sets, ts FROM signal_log "
-        "ORDER BY ts DESC LIMIT 15")]
+        "SELECT signal_id, strategy, kind, group_id, net_edge, exec_sets, outcome, ts "
+        "FROM signal_log ORDER BY ts DESC LIMIT 15")]
+
+    # signal performance by strategy/kind (labeler outcomes)
+    signal_perf = [dict(r) for r in conn.execute(
+        "SELECT strategy, kind, COUNT(*) n, "
+        "SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END) labeled, "
+        "AVG(outcome) avg_outcome, "
+        "AVG(CASE WHEN outcome > 0 THEN 1.0 WHEN outcome IS NOT NULL THEN 0.0 END) hit_rate "
+        "FROM signal_log GROUP BY strategy, kind ORDER BY strategy, kind")]
 
     # recent execution decisions
     execution = [dict(r) for r in conn.execute(
@@ -121,6 +129,7 @@ def query_state(conn, settings) -> dict:
         "recon": recon,
         "categories": categories,
         "signals": signals,
+        "signal_perf": signal_perf,
         "execution": execution,
         "top_markets": top_markets,
         "event_log": _event_log_status(settings),
@@ -217,6 +226,10 @@ INDEX_HTML = """<!DOCTYPE html>
     <div id="signals"></div>
   </section>
   <section>
+    <h2>Signal performance (labeled forward returns)</h2>
+    <div id="signalperf"></div>
+  </section>
+  <section>
     <h2>Recent execution</h2>
     <div id="execution"></div>
   </section>
@@ -274,13 +287,25 @@ async function refresh() {
     : '<div class="empty">no markets yet</div>';
 
   $("signals").innerHTML = s.signals.length ?
-    `<table><tr><th>id</th><th>kind</th><th>group</th><th class="num">net edge</th>
-       <th class="num">sets</th><th class="num">age</th></tr>` +
-    s.signals.map(g => `<tr><td>${g.signal_id}</td><td>${esc(g.kind)}</td>
+    `<table><tr><th>id</th><th>strategy</th><th>kind</th><th>group</th><th class="num">net edge</th>
+       <th class="num">sets</th><th class="num">outcome</th><th class="num">age</th></tr>` +
+    s.signals.map(g => `<tr><td>${g.signal_id}</td><td><span class="tag">${esc(g.strategy)}</span></td>
+      <td>${esc(g.kind)}</td>
       <td>${esc((g.group_id||"").slice(0,18))}…</td>
       <td class="num">${g.net_edge.toFixed(4)}</td><td class="num">${g.exec_sets.toFixed(1)}</td>
+      <td class="num">${g.outcome == null ? "—" : g.outcome.toFixed(4)}</td>
       <td class="num">${fmtAge(s.now - g.ts)}</td></tr>`).join("") + `</table>`
     : '<div class="empty">no signals fired yet — expected when no arb exists (system is signal-only)</div>';
+
+  $("signalperf").innerHTML = s.signal_perf.length ?
+    `<table><tr><th>strategy</th><th>kind</th><th class="num">signals</th>
+       <th class="num">labeled</th><th class="num">hit rate</th><th class="num">avg fwd edge</th></tr>` +
+    s.signal_perf.map(p => `<tr><td><span class="tag">${esc(p.strategy)}</span></td>
+      <td>${esc(p.kind)}</td><td class="num">${p.n}</td><td class="num">${p.labeled}</td>
+      <td class="num">${p.labeled ? (p.hit_rate*100).toFixed(0)+"%" : "—"}</td>
+      <td class="num">${p.labeled ? (p.avg_outcome>=0?"+":"")+p.avg_outcome.toFixed(4) : "—"}</td>
+      </tr>`).join("") + `</table>`
+    : '<div class="empty">no signals to evaluate yet</div>';
 
   $("execution").innerHTML = s.execution.length ?
     `<table><tr><th>id</th><th>signal</th><th>kind</th><th>token</th><th>side</th>

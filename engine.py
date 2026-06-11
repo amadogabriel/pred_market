@@ -29,6 +29,7 @@ from pm.ingestion.event_logger import event_logger_task
 from pm.ingestion.metadata_sync import metadata_sync_loop
 from pm.ingestion.rest_recon import recon_task
 from pm.ingestion.ws_polymarket import PolymarketWS
+from pm.signals.labeler import labeler_task
 from pm.signals.scan_task import scan_task
 
 log = logging.getLogger(__name__)
@@ -79,6 +80,8 @@ async def main() -> None:
                            name="scan")
             tg.create_task(execution_task(bus, conn, settings, hard_live_gate=LIVE_TRADING),
                            name="execution")
+            tg.create_task(labeler_task(conn, books, settings),
+                           name="labeler")
             tg.create_task(heartbeat_task(conn, settings),
                            name="heartbeat")
     finally:

@@ -1,14 +1,20 @@
 """Tests for execution planning, risk gates, and accounting."""
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
 
+from config.settings import Settings
 from pm.core import db
+from pm.core.bus import Bus
+from pm.core.events import Event, T_SIGNAL
 from pm.execution.accounting import apply_fill
+from pm.execution.broker import DryRunBroker
 from pm.execution.models import intents_from_signal
 from pm.execution.risk import RiskLimits, RiskManager
+from pm.execution.task import _handle_signal_event
 
 
 def _limits(tmp_path: Path, **overrides) -> RiskLimits:
@@ -107,6 +113,34 @@ def test_risk_rejects_sell_without_inventory(tmp_path):
     decision = risk.check_intent(conn, intent)
     assert decision.approved is False
     assert decision.code == "insufficient_inventory"
+
+
+def test_research_strategies_skip_execution_pipeline_entirely(tmp_path):
+    """Signals from non-allowlisted strategies must leave zero execution traces."""
+    conn = db.connect(tmp_path / "state.db")
+    settings = Settings()  # default allowlist: {"struct_arb"}
+    assert "microstructure" not in settings.execution_strategies
+    risk = RiskManager(RiskLimits.from_settings(settings))
+    event = Event(T_SIGNAL, {"strategy": "microstructure", "signal_id": 1,
+                             "kind": "ofi_pressure", "exec_sets": 0.0})
+
+    asyncio.run(_handle_signal_event(Bus(), conn, settings, DryRunBroker(), risk, event))
+
+    assert conn.execute("SELECT COUNT(*) FROM execution_intents").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM risk_events").fetchone()[0] == 0
+
+
+def test_allowlisted_strategy_still_reaches_risk_pipeline(tmp_path):
+    """struct_arb signals continue to be processed (here: rejected as missing)."""
+    conn = db.connect(tmp_path / "state.db")
+    settings = Settings()
+    risk = RiskManager(RiskLimits.from_settings(settings))
+    event = Event(T_SIGNAL, {"strategy": "struct_arb", "signal_id": 999})
+
+    asyncio.run(_handle_signal_event(Bus(), conn, settings, DryRunBroker(), risk, event))
+
+    rows = conn.execute("SELECT code FROM risk_events").fetchall()
+    assert [r["code"] for r in rows] == ["signal_missing"]
 
 
 def test_apply_fill_updates_position_and_realized_pnl(tmp_path):

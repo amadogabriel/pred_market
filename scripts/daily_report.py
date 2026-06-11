@@ -51,6 +51,28 @@ def main(argv: list[str] | None = None) -> int:
     for row in conn.execute("SELECT component, ts, detail FROM heartbeats ORDER BY component"):
         detail = f" ({row['detail']})" if row["detail"] else ""
         print(f"  {row['component']:<16} {now - row['ts']:.1f}s{detail}")
+
+    print()
+    print("signal performance (labeler outcomes, all time)")
+    print("-----------------------------------------------")
+    rows = conn.execute(
+        "SELECT strategy, kind, COUNT(*) n, "
+        "SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END) labeled, "
+        "AVG(outcome) avg_outcome, "
+        "AVG(CASE WHEN outcome > 0 THEN 1.0 WHEN outcome IS NOT NULL THEN 0.0 END) hit_rate "
+        "FROM signal_log GROUP BY strategy, kind ORDER BY strategy, kind").fetchall()
+    if not rows:
+        print("  no signals yet")
+    for r in rows:
+        if r["labeled"]:
+            perf = (f"hit_rate={r['hit_rate']:.0%} avg_fwd_edge={r['avg_outcome']:+.4f} "
+                    f"(labeled {r['labeled']}/{r['n']})")
+        else:
+            perf = f"unlabeled ({r['n']} signals)"
+        print(f"  {r['strategy']:<16} {r['kind']:<22} {perf}")
+    print()
+    print("note: research signals (exec_sets=0) are hypotheses; promote to the")
+    print("execution allowlist only after sustained positive labeled outcomes.")
     return 0
 
 

@@ -1,13 +1,20 @@
 """Signal scan task.
 
-Drives the structural-arb scanner from live book updates. On every `book` /
-`price_change` event it resolves the updated asset to its market, runs the
-complement check, and — if the market is part of a NegRisk group — the
-partition scan. Emitted signals are persisted to `signal_log` and republished
-on the bus (so the event logger captures them too).
+Drives all live-data scanners from one bus subscription:
 
-Signal-only: nothing here places orders. The `signal` topic is lossless, so a
-wedged consumer surfaces as a bus RuntimeError rather than silent data loss.
+- struct_arb (S1)      — executable arb candidates (complement + partition)
+- microstructure (S2)  — research: OFI pressure, liquidity shocks, trade-through
+- rel_value (S3)       — research: partition-sum drift, complement mid drift
+
+On every `book` / `price_change` event the updated asset is resolved to its
+market; struct_arb and the research scanners run against the affected market
+and (if NegRisk) its partition group. `last_trade_price` events feed the
+trade-through detector. Emitted signals are persisted to `signal_log` and
+republished on the bus (so the event logger captures them too).
+
+Signal-only: nothing here places orders. Research signals carry exec_sets=0 so
+they can never form an execution plan, and the execution task's strategy
+allowlist filters them out before any risk machinery runs.
 """
 from __future__ import annotations
 
@@ -17,8 +24,11 @@ import time
 
 from pm.core.bus import Bus
 from pm.core.db import beat, log_signal
-from pm.core.events import Event, T_BOOK, T_PRICE_CHANGE, T_SIGNAL
+from pm.core.events import Event, T_BOOK, T_PRICE_CHANGE, T_SIGNAL, T_TRADE
 from pm.execution.fee_engine import FeeEngine
+from pm.signals.common import ResearchSignal
+from pm.signals.microstructure import MicrostructureTracker
+from pm.signals.relative_value import RelativeValueMonitor
 from pm.signals.struct_arb import ArbSignal, StructArbScanner
 
 log = logging.getLogger(__name__)
@@ -48,8 +58,8 @@ def _load_market_index(conn) -> dict[str, dict]:
     return index
 
 
-def _persist_and_publish(conn, bus: Bus, scanner: StructArbScanner,
-                         signals: list[ArbSignal]) -> int:
+def _persist_arb(conn, bus: Bus, scanner: StructArbScanner,
+                 signals: list[ArbSignal]) -> int:
     emitted = 0
     for sig in signals:
         if not scanner.should_emit(sig):
@@ -69,13 +79,47 @@ def _persist_and_publish(conn, bus: Bus, scanner: StructArbScanner,
     return emitted
 
 
+def _persist_research(conn, bus: Bus, signals: list[ResearchSignal]) -> int:
+    """Research signals are pre-debounced by their trackers; persist directly."""
+    for sig in signals:
+        sid = log_signal(conn, strategy=sig.strategy, kind=sig.kind,
+                         group_id=sig.group_id, legs=sig.legs,
+                         gross_edge=sig.gross_edge, fees=sig.fees,
+                         net_edge=sig.net_edge, exec_sets=0.0,
+                         features=sig.features)
+        bus.publish(Event(T_SIGNAL, {
+            "strategy": sig.strategy, "signal_id": sid, "kind": sig.kind,
+            "group_id": sig.group_id, "net_edge": sig.net_edge,
+            "exec_sets": 0.0}))
+        log.info("research %d: %s/%s group=%s gross=%.4f",
+                 sid, sig.strategy, sig.kind, sig.group_id, sig.gross_edge)
+    return len(signals)
+
+
 async def scan_task(bus: Bus, conn, books, fee_engine: FeeEngine, settings,
                     neg_risk_groups: dict[str, list[dict]]) -> None:
-    """Subscribe to book updates and scan the affected market on each one."""
+    """Subscribe to book/trade updates and scan the affected market on each one."""
     scanner = StructArbScanner(
         books, fee_engine, buffer=settings.arb_buffer,
         min_sets=settings.arb_min_set_size, stale_after=settings.stale_book_after)
-    queue = bus.subscribe(T_BOOK, T_PRICE_CHANGE)
+
+    micro = rv = None
+    if settings.research_signals_enabled:
+        micro = MicrostructureTracker(
+            books, fee_engine,
+            window_s=settings.micro_window_s, min_samples=settings.micro_min_samples,
+            ofi_threshold=settings.micro_ofi_threshold, max_spread=settings.micro_max_spread,
+            liq_spread_mult=settings.micro_liq_spread_mult,
+            liq_depth_drop=settings.micro_liq_depth_drop,
+            trade_abs_floor=settings.micro_trade_abs_floor,
+            debounce_s=settings.micro_debounce_s, stale_after=settings.stale_book_after)
+        rv = RelativeValueMonitor(
+            books, fee_engine,
+            window_s=settings.rv_window_s, min_samples=settings.rv_min_samples,
+            z_threshold=settings.rv_z_threshold, min_abs_dev=settings.rv_min_abs_dev,
+            debounce_s=settings.rv_debounce_s, stale_after=settings.stale_book_after)
+
+    queue = bus.subscribe(T_BOOK, T_PRICE_CHANGE, T_TRADE)
 
     index = _load_market_index(conn)
     last_index = time.time()
@@ -99,18 +143,42 @@ async def scan_task(bus: Bus, conn, books, fee_engine: FeeEngine, settings,
                 asset_id = event.payload.get("asset_id")
                 meta = index.get(asset_id) if asset_id else None
                 if meta is not None:
-                    sigs = scanner.scan_complement(
-                        meta["market_id"], meta["token_yes"], meta["token_no"],
-                        meta["category"])
-                    group_id = meta["neg_risk_id"]
-                    if group_id and group_id in neg_risk_groups:
-                        sigs = sigs + scanner.scan_partition(
-                            group_id, neg_risk_groups[group_id])
-                    if sigs:
-                        _persist_and_publish(conn, bus, scanner, sigs)
+                    if event.topic == T_TRADE:
+                        if micro is not None:
+                            _persist_research(conn, bus,
+                                              micro.on_trade(event.payload, meta))
+                    else:
+                        _scan_book_update(conn, bus, scanner, micro, rv,
+                                          asset_id, meta, neg_risk_groups)
             except Exception:  # noqa: BLE001 — one bad event must not kill the scanner
                 log.exception("scan failed for event %r", event.topic)
 
         if now - last_beat > settings.heartbeat_interval:
             beat(conn, "scan_task")
             last_beat = now
+
+
+def _scan_book_update(conn, bus: Bus, scanner: StructArbScanner,
+                      micro: MicrostructureTracker | None,
+                      rv: RelativeValueMonitor | None,
+                      asset_id: str, meta: dict,
+                      neg_risk_groups: dict[str, list[dict]]) -> None:
+    # S1 — executable arb candidates
+    sigs = scanner.scan_complement(
+        meta["market_id"], meta["token_yes"], meta["token_no"], meta["category"])
+    group_id = meta["neg_risk_id"]
+    legs_meta = neg_risk_groups.get(group_id) if group_id else None
+    if legs_meta:
+        sigs = sigs + scanner.scan_partition(group_id, legs_meta)
+    if sigs:
+        _persist_arb(conn, bus, scanner, sigs)
+
+    # S2 — microstructure research
+    if micro is not None:
+        _persist_research(conn, bus, micro.on_book_update(asset_id, meta))
+
+    # S3 — relative-value research
+    if rv is not None:
+        _persist_research(conn, bus, rv.on_market_update(meta))
+        if legs_meta:
+            _persist_research(conn, bus, rv.on_group_update(group_id, legs_meta))

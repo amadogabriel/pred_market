@@ -169,6 +169,32 @@ Every NegRisk group must be manually verified before any execution is enabled.
 
 ---
 
+## Research signals (S2 microstructure, S3 relative value) + labeler
+
+Research signals are observational by contract: `exec_sets=0` (can never form
+an execution plan) AND their strategies are absent from the execution task's
+`PM_EXECUTION_STRATEGIES` allowlist. They exist to build the meta-label
+dataset; promote one to executable only after labeler validation + review.
+
+`pm/signals/microstructure.py` (strategy `microstructure`):
+- `ofi_pressure` — sustained depth imbalance at the touch while spread is tight
+- `liquidity_shock` — spread blowout + depth evaporation vs own baseline
+- `trade_through` — trade printing beyond fees away from mid (informed flow)
+
+`pm/signals/relative_value.py` (strategy `rel_value`):
+- `partition_sum_drift` — NegRisk group's YES-mid sum z-scored against its OWN
+  rolling baseline (groups may legitimately not sum to 1.00); features carry
+  `mover_token` (repriced) and `laggard_token` (stale quote = candidate edge)
+- `complement_drift` — YES_mid + NO_mid departing from 1.00 beyond fees
+
+`pm/signals/labeler.py` — fills `signal_log.outcome/pnl` with forward mid
+returns `PM_LABEL_HORIZON` (default 900s) after each signal. Outcome is signed
+per leg (BUY: mid_now − price; SELL: inverse) and averaged. This is what turns
+signal_log into training data; analyze hit rates per kind before trusting any
+research signal.
+
+---
+
 ## What exists now (Phase 0 — code complete)
 
 | File | Status |
@@ -185,7 +211,10 @@ Every NegRisk group must be manually verified before any execution is enabled.
 | `pm/ingestion/metadata_sync.py` | ✅ done — fetches Gamma `/events` (tags→category, event=NegRisk group) |
 | `pm/ingestion/event_logger.py` | ✅ done |
 | `pm/ingestion/rest_recon.py` | ✅ done — recon diffs verified 0.0 vs REST |
-| `pm/signals/scan_task.py` | ✅ done |
+| `pm/signals/scan_task.py` | ✅ done — drives S1 + S2 + S3 from one subscription |
+| `pm/signals/microstructure.py` | ✅ done — S2 research signals (OFI, liquidity, trade-through) |
+| `pm/signals/relative_value.py` | ✅ done — S3 research signals (partition/complement drift) |
+| `pm/signals/labeler.py` | ✅ done — forward-return outcome labeler |
 | `engine.py` | ✅ done — live-run verified |
 | `monitor.py` | ✅ done — stale-heartbeat alert verified |
 | `dashboard.py` | ✅ done — read-only web dashboard (aiohttp) |

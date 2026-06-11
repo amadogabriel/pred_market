@@ -66,6 +66,32 @@ class Settings:
     kill_switch_path: Path = field(default_factory=lambda: Path(
         _env("PM_KILL_SWITCH", str(ROOT / "data" / "KILL_SWITCH"))))
 
+    # --- research signals (S2 microstructure / S3 relative value; never executable) ---
+    research_signals_enabled: bool = field(default_factory=lambda: _env_bool("PM_RESEARCH_SIGNALS", "true"))
+    micro_window_s: float = field(default_factory=lambda: float(_env("PM_MICRO_WINDOW", "300")))
+    micro_min_samples: int = field(default_factory=lambda: int(_env("PM_MICRO_MIN_SAMPLES", "20")))
+    micro_ofi_threshold: float = field(default_factory=lambda: float(_env("PM_MICRO_OFI", "0.6")))
+    micro_max_spread: float = field(default_factory=lambda: float(_env("PM_MICRO_MAX_SPREAD", "0.03")))
+    micro_liq_spread_mult: float = field(default_factory=lambda: float(_env("PM_MICRO_LIQ_SPREAD_MULT", "3.0")))
+    micro_liq_depth_drop: float = field(default_factory=lambda: float(_env("PM_MICRO_LIQ_DEPTH_DROP", "0.5")))
+    micro_trade_abs_floor: float = field(default_factory=lambda: float(_env("PM_MICRO_TRADE_FLOOR", "0.01")))
+    micro_debounce_s: float = field(default_factory=lambda: float(_env("PM_MICRO_DEBOUNCE", "120")))
+    rv_window_s: float = field(default_factory=lambda: float(_env("PM_RV_WINDOW", "1800")))
+    rv_min_samples: int = field(default_factory=lambda: int(_env("PM_RV_MIN_SAMPLES", "30")))
+    rv_z_threshold: float = field(default_factory=lambda: float(_env("PM_RV_Z", "3.0")))
+    rv_min_abs_dev: float = field(default_factory=lambda: float(_env("PM_RV_MIN_DEV", "0.02")))
+    rv_debounce_s: float = field(default_factory=lambda: float(_env("PM_RV_DEBOUNCE", "120")))
+
+    # --- signal outcome labeler (fills signal_log.outcome with forward returns) ---
+    label_horizon_s: float = field(default_factory=lambda: float(_env("PM_LABEL_HORIZON", "900")))
+    label_max_age_s: float = field(default_factory=lambda: float(_env("PM_LABEL_MAX_AGE", "86400")))
+    label_batch: int = field(default_factory=lambda: int(_env("PM_LABEL_BATCH", "200")))
+    label_poll_s: float = field(default_factory=lambda: float(_env("PM_LABEL_POLL", "60")))
+
+    # --- execution strategy allowlist (research strategies must never appear here) ---
+    execution_strategies: frozenset[str] = field(default_factory=lambda: frozenset(
+        s.strip() for s in _env("PM_EXECUTION_STRATEGIES", "struct_arb").split(",") if s.strip()))
+
     # --- telegram (monitor process) ---
     telegram_token: str = field(default_factory=lambda: _env("PM_TG_TOKEN", ""))
     telegram_chat_id: str = field(default_factory=lambda: _env("PM_TG_CHAT", ""))
