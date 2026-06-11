@@ -283,11 +283,11 @@ async function refresh() {
     : '<div class="empty">no signals fired yet — expected when no arb exists (system is signal-only)</div>';
 
   $("execution").innerHTML = s.execution.length ?
-    `<table><tr><th>id</th><th>signal</th><th>kind</th><th>side</th>
+    `<table><tr><th>id</th><th>signal</th><th>kind</th><th>token</th><th>side</th>
        <th class="num">price</th><th class="num">size</th><th class="num">notional</th>
        <th>status</th><th>reason</th></tr>` +
     s.execution.map(e => `<tr><td>${e.intent_id}</td><td>${e.signal_id ?? ""}</td>
-      <td>${esc(e.kind)}</td><td>${esc(e.side)}</td>
+      <td>${esc(e.kind)}</td><td>${esc((e.token_id||"").slice(0,18))}</td><td>${esc(e.side)}</td>
       <td class="num">${Number(e.price).toFixed(4)}</td>
       <td class="num">${Number(e.size).toFixed(1)}</td>
       <td class="num">${fmtUsd(e.notional)}</td>
