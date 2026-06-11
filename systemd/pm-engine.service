@@ -1,0 +1,18 @@
+[Unit]
+Description=pm-system engine
+After=network.target
+Wants=pm-monitor.service
+
+[Service]
+Type=simple
+User=pm
+WorkingDirectory=/home/pm/pm-system
+EnvironmentFile=/home/pm/pm-system/.env
+ExecStart=/home/pm/.venv/bin/python engine.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

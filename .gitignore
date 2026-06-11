@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime state (created by the engine; never commit)
+data/
+
+# Secrets — only .env.example is committed
+.env
+.env.*
+!.env.example
+
+# Logs / scratch
+*.log
+*.out
+*.err

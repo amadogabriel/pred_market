@@ -1,0 +1,17 @@
+[Unit]
+Description=pm-system dashboard (read-only web UI)
+After=network.target
+
+[Service]
+Type=simple
+User=pm
+WorkingDirectory=/home/pm/pm-system
+EnvironmentFile=/home/pm/pm-system/.env
+ExecStart=/home/pm/.venv/bin/python dashboard.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

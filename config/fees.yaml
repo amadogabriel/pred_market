@@ -1,0 +1,42 @@
+# Fee schedules, versioned by effective date. The fee engine picks the latest
+# schedule whose effective_date <= now. NEVER edit a past schedule in place —
+# add a new dated entry so replay/backtests over old data use the fees that
+# actually applied at the time.
+#
+# VERIFY THESE AGAINST THE LIVE PUBLISHED SCHEDULES BEFORE TRADING.
+# Re-verify monthly (standing cadence in the system doc).
+#
+# Polymarket model: taker_fee = shares * rate * p * (1 - p)
+#   -> peak effective fee at p = 0.50 is rate / 4
+#   -> e.g. sports rate 0.03 => max $0.75 per 100 shares at p = 0.50
+# Maker orders: fee = shares * maker_rate * p * (1 - p) (0.0 = free).
+#
+# Kalshi model: per-side fee = round_up_to_cent(shares * rate * p * (1 - p))
+
+schedules:
+  - venue: polymarket
+    effective_date: "2026-04-01"
+    model: rate_p_one_minus_p
+    maker_rate: 0.0
+    min_fee: 0.0001          # fees rounded; below this rounds to zero
+    round_decimals: 4
+    default_rate: 0.05       # unknown category -> assume 1.25% peak (conservative mid)
+    category_rates:
+      geopolitics: 0.0       # fee-free
+      sports: 0.03           # 0.75% peak
+      politics: 0.04         # 1.00% peak
+      finance: 0.04
+      tech: 0.04
+      mentions: 0.04
+      economics: 0.06        # 1.50% peak
+      culture: 0.05          # 1.25% peak
+      weather: 0.05
+      crypto: 0.072          # 1.80% peak
+      other: 0.05
+
+  - venue: kalshi
+    effective_date: "2026-01-01"
+    model: rate_p_one_minus_p_per_side_ceil_cent
+    maker_rate: 0.0
+    default_rate: 0.07
+    category_rates: {}       # Kalshi general formula; some series differ — verify
