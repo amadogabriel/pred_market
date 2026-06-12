@@ -28,6 +28,7 @@ from pm.core.events import Event, T_BOOK, T_PRICE_CHANGE, T_SIGNAL, T_TRADE
 from pm.execution.fee_engine import FeeEngine
 from pm.signals.common import ResearchSignal
 from pm.signals.microstructure import MicrostructureTracker
+from pm.signals.momentum import MomentumTracker
 from pm.signals.relative_value import RelativeValueMonitor
 from pm.signals.struct_arb import ArbSignal, StructArbScanner
 
@@ -103,7 +104,7 @@ async def scan_task(bus: Bus, conn, books, fee_engine: FeeEngine, settings,
         books, fee_engine, buffer=settings.arb_buffer,
         min_sets=settings.arb_min_set_size, stale_after=settings.stale_book_after)
 
-    micro = rv = None
+    micro = rv = mom = None
     if settings.research_signals_enabled:
         micro = MicrostructureTracker(
             books, fee_engine,
@@ -118,6 +119,15 @@ async def scan_task(bus: Bus, conn, books, fee_engine: FeeEngine, settings,
             window_s=settings.rv_window_s, min_samples=settings.rv_min_samples,
             z_threshold=settings.rv_z_threshold, min_abs_dev=settings.rv_min_abs_dev,
             debounce_s=settings.rv_debounce_s, stale_after=settings.stale_book_after)
+        mom = MomentumTracker(
+            books, fee_engine,
+            window_s=settings.mom_window_s, min_samples=settings.mom_min_samples,
+            z_threshold=settings.mom_z_threshold,
+            min_abs_drift=settings.mom_min_abs_drift,
+            boundary_low=settings.mom_boundary_low,
+            boundary_high=settings.mom_boundary_high,
+            boundary_bounce=settings.mom_boundary_bounce,
+            debounce_s=settings.mom_debounce_s, stale_after=settings.stale_book_after)
 
     queue = bus.subscribe(T_BOOK, T_PRICE_CHANGE, T_TRADE)
 
@@ -148,7 +158,7 @@ async def scan_task(bus: Bus, conn, books, fee_engine: FeeEngine, settings,
                             _persist_research(conn, bus,
                                               micro.on_trade(event.payload, meta))
                     else:
-                        _scan_book_update(conn, bus, scanner, micro, rv,
+                        _scan_book_update(conn, bus, scanner, micro, rv, mom,
                                           asset_id, meta, neg_risk_groups)
             except Exception:  # noqa: BLE001 — one bad event must not kill the scanner
                 log.exception("scan failed for event %r", event.topic)
@@ -161,6 +171,7 @@ async def scan_task(bus: Bus, conn, books, fee_engine: FeeEngine, settings,
 def _scan_book_update(conn, bus: Bus, scanner: StructArbScanner,
                       micro: MicrostructureTracker | None,
                       rv: RelativeValueMonitor | None,
+                      mom: MomentumTracker | None,
                       asset_id: str, meta: dict,
                       neg_risk_groups: dict[str, list[dict]]) -> None:
     # S1 — executable arb candidates
@@ -182,3 +193,7 @@ def _scan_book_update(conn, bus: Bus, scanner: StructArbScanner,
         _persist_research(conn, bus, rv.on_market_update(meta))
         if legs_meta:
             _persist_research(conn, bus, rv.on_group_update(group_id, legs_meta))
+
+    # S4 — momentum / boundary research
+    if mom is not None:
+        _persist_research(conn, bus, mom.on_book_update(asset_id, meta))

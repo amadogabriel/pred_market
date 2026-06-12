@@ -169,7 +169,7 @@ Every NegRisk group must be manually verified before any execution is enabled.
 
 ---
 
-## Research signals (S2 microstructure, S3 relative value) + labeler
+## Research signals (S2 microstructure, S3 relative value, S4 momentum) + labeler
 
 Research signals are observational by contract: `exec_sets=0` (can never form
 an execution plan) AND their strategies are absent from the execution task's
@@ -186,6 +186,14 @@ dataset; promote one to executable only after labeler validation + review.
   rolling baseline (groups may legitimately not sum to 1.00); features carry
   `mover_token` (repriced) and `laggard_token` (stale quote = candidate edge)
 - `complement_drift` — YES_mid + NO_mid departing from 1.00 beyond fees
+
+`pm/signals/momentum.py` (strategy `momentum`):
+- `directional_momentum` — sustained signed mid drift over the window, z-scored
+  against the token's own per-step volatility (random-walk null). Whether it
+  persists or reverts in prediction markets is what the labeler is for.
+- `boundary_overshoot` — YES mid pinned beyond `boundary_low`/`high` for the
+  full window, then a meaningful interior-direction bounce in the latest
+  sample. The classic "extreme price + initial reversion" setup.
 
 `pm/signals/labeler.py` — fills `signal_log.outcome/pnl` with forward mid
 returns `PM_LABEL_HORIZON` (default 900s) after each signal. Outcome is signed
@@ -214,6 +222,7 @@ research signal.
 | `pm/signals/scan_task.py` | ✅ done — drives S1 + S2 + S3 from one subscription |
 | `pm/signals/microstructure.py` | ✅ done — S2 research signals (OFI, liquidity, trade-through) |
 | `pm/signals/relative_value.py` | ✅ done — S3 research signals (partition/complement drift) |
+| `pm/signals/momentum.py` | ✅ done — S4 research signals (directional drift, boundary overshoot) |
 | `pm/signals/labeler.py` | ✅ done — forward-return outcome labeler |
 | `engine.py` | ✅ done — live-run verified |
 | `monitor.py` | ✅ done — stale-heartbeat alert verified |

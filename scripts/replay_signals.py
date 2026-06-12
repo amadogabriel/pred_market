@@ -37,6 +37,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--z", type=float, default=settings.rv_z_threshold)
     p.add_argument("--rv-min-samples", type=int, default=settings.rv_min_samples)
     p.add_argument("--rv-min-dev", type=float, default=settings.rv_min_abs_dev)
+    # momentum overrides
+    p.add_argument("--mom-z", type=float, default=settings.mom_z_threshold)
+    p.add_argument("--mom-min-samples", type=int, default=settings.mom_min_samples)
+    p.add_argument("--mom-min-drift", type=float, default=settings.mom_min_abs_drift)
     args = p.parse_args(argv)
 
     conn = db.connect(args.db)
@@ -56,6 +60,15 @@ def main(argv: list[str] | None = None) -> int:
             "z_threshold": args.z, "min_samples": args.rv_min_samples,
             "min_abs_dev": args.rv_min_dev, "debounce_s": settings.rv_debounce_s,
             "window_s": settings.rv_window_s,
+        },
+        mom_kwargs={
+            "z_threshold": args.mom_z, "min_samples": args.mom_min_samples,
+            "min_abs_drift": args.mom_min_drift,
+            "boundary_low": settings.mom_boundary_low,
+            "boundary_high": settings.mom_boundary_high,
+            "boundary_bounce": settings.mom_boundary_bounce,
+            "debounce_s": settings.mom_debounce_s,
+            "window_s": settings.mom_window_s,
         })
 
     print(f"replayed {result.events} market events, "

@@ -82,6 +82,16 @@ class Settings:
     rv_min_abs_dev: float = field(default_factory=lambda: float(_env("PM_RV_MIN_DEV", "0.02")))
     rv_debounce_s: float = field(default_factory=lambda: float(_env("PM_RV_DEBOUNCE", "120")))
 
+    # --- momentum / boundary-overshoot (S4 research; never executable) ---
+    mom_window_s: float = field(default_factory=lambda: float(_env("PM_MOM_WINDOW", "300")))
+    mom_min_samples: int = field(default_factory=lambda: int(_env("PM_MOM_MIN_SAMPLES", "20")))
+    mom_z_threshold: float = field(default_factory=lambda: float(_env("PM_MOM_Z", "2.5")))
+    mom_min_abs_drift: float = field(default_factory=lambda: float(_env("PM_MOM_MIN_DRIFT", "0.01")))
+    mom_boundary_low: float = field(default_factory=lambda: float(_env("PM_MOM_BND_LOW", "0.05")))
+    mom_boundary_high: float = field(default_factory=lambda: float(_env("PM_MOM_BND_HIGH", "0.95")))
+    mom_boundary_bounce: float = field(default_factory=lambda: float(_env("PM_MOM_BND_BOUNCE", "0.01")))
+    mom_debounce_s: float = field(default_factory=lambda: float(_env("PM_MOM_DEBOUNCE", "180")))
+
     # --- signal outcome labeler (fills signal_log.outcome with forward returns) ---
     label_horizon_s: float = field(default_factory=lambda: float(_env("PM_LABEL_HORIZON", "900")))
     label_max_age_s: float = field(default_factory=lambda: float(_env("PM_LABEL_MAX_AGE", "86400")))

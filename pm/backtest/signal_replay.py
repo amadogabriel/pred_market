@@ -26,6 +26,7 @@ from pm.execution.fee_engine import FeeEngine
 from pm.backtest.replay import event_files, iter_event_records
 from pm.signals.common import ResearchSignal, mid_price
 from pm.signals.microstructure import MicrostructureTracker
+from pm.signals.momentum import MomentumTracker
 from pm.signals.relative_value import RelativeValueMonitor
 
 log = logging.getLogger(__name__)
@@ -84,6 +85,7 @@ def replay_signals(events_dir: Path, conn: sqlite3.Connection, fees: FeeEngine, 
                    horizon_s: float = 900.0, stale_after: float = 30.0,
                    micro_kwargs: dict | None = None,
                    rv_kwargs: dict | None = None,
+                   mom_kwargs: dict | None = None,
                    max_events: int | None = None) -> ReplayResult:
     index, groups = load_market_index(conn)
     books = BookStore()
@@ -92,6 +94,8 @@ def replay_signals(events_dir: Path, conn: sqlite3.Connection, fees: FeeEngine, 
                                   clock=clock, **(micro_kwargs or {}))
     rv = RelativeValueMonitor(books, fees, stale_after=stale_after,
                               clock=clock, **(rv_kwargs or {}))
+    mom = MomentumTracker(books, fees, stale_after=stale_after,
+                          clock=clock, **(mom_kwargs or {}))
 
     signals: list[tuple[float, ResearchSignal]] = []
     # per-token sparse mid series for forward returns: token -> ([ts], [mid])
@@ -130,6 +134,7 @@ def replay_signals(events_dir: Path, conn: sqlite3.Connection, fees: FeeEngine, 
         else:
             out = micro.on_book_update(asset_id, meta)
             out += rv.on_market_update(meta)
+            out += mom.on_book_update(asset_id, meta)
             gid = meta.get("neg_risk_id")
             if gid and gid in groups:
                 out += rv.on_group_update(gid, groups[gid])

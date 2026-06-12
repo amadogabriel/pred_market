@@ -26,6 +26,9 @@ Status: implemented (signal capture only; never executable).
   liquidity_shock, trade_through
 - S3 relative value (`pm/signals/relative_value.py`): partition_sum_drift
   (with mover/laggard attribution), complement_drift
+- S4 momentum (`pm/signals/momentum.py`): directional_momentum (z-scored
+  drift against own per-step vol), boundary_overshoot (extreme price +
+  interior-direction bounce)
 - Outcome labeler (`pm/signals/labeler.py`): fills signal_log.outcome/pnl
   with forward mid returns after PM_LABEL_HORIZON
 - Offline replay harness (`scripts/replay_signals.py`): re-runs the scanners
