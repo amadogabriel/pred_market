@@ -86,8 +86,11 @@ class RelativeValueMonitor:
         # attribution: who moved, who lagged
         moves = {t: mids[t] - prev_mids.get(t, mids[t]) for t in mids}
         mover = max(moves, key=lambda t: abs(moves[t])) if moves else None
+        laggard_candidates = [lm["token_yes"] for lm in legs_meta if lm["token_yes"] != mover]
+        if not laggard_candidates:
+            laggard_candidates = [lm["token_yes"] for lm in legs_meta]
         laggard = min(
-            (lm["token_yes"] for lm in legs_meta),
+            laggard_candidates,
             key=lambda t: self.books.peek(t).last_update if self.books.peek(t) else 0.0,
             default=None)
 

@@ -91,6 +91,19 @@ def query_state(conn, settings) -> dict:
         "recent": scalar("SELECT COUNT(*) FROM recon_log WHERE ts>?", since),
     }
 
+    earnings = {
+        "signal_ev": round(scalar(
+            "SELECT COALESCE(SUM(net_edge * exec_sets),0) FROM signal_log"), 4),
+        "labeled_sim_pnl": round(scalar(
+            "SELECT COALESCE(SUM(pnl),0) FROM signal_log WHERE pnl IS NOT NULL"), 4),
+        "paper_realized_pnl": round(scalar(
+            "SELECT COALESCE(SUM(realized_pnl),0) FROM positions"), 4),
+        "paper_open_cost": round(scalar(
+            "SELECT COALESCE(SUM(ABS(size) * avg_price),0) FROM positions WHERE ABS(size)>0"), 4),
+        "filled_notional": round(scalar(
+            "SELECT COALESCE(SUM(price * size),0) FROM execution_fills"), 4),
+    }
+
     # category breakdown
     categories = [
         {"category": (r["category"] or "(none)"), "n": r["n"]}
@@ -108,6 +121,8 @@ def query_state(conn, settings) -> dict:
         "SELECT strategy, kind, COUNT(*) n, "
         "SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END) labeled, "
         "AVG(outcome) avg_outcome, "
+        "COALESCE(SUM(net_edge * exec_sets),0) signal_ev, "
+        "COALESCE(SUM(CASE WHEN pnl IS NOT NULL THEN pnl ELSE 0 END),0) sim_pnl, "
         "AVG(CASE WHEN outcome > 0 THEN 1.0 WHEN outcome IS NOT NULL THEN 0.0 END) hit_rate "
         "FROM signal_log GROUP BY strategy, kind ORDER BY strategy, kind")]
 
@@ -127,6 +142,7 @@ def query_state(conn, settings) -> dict:
         "components": components,
         "counts": counts,
         "recon": recon,
+        "earnings": earnings,
         "categories": categories,
         "signals": signals,
         "signal_perf": signal_perf,
@@ -226,6 +242,10 @@ INDEX_HTML = """<!DOCTYPE html>
     <div id="signals"></div>
   </section>
   <section>
+    <h2>Simulated earnings</h2>
+    <div id="earnings"></div>
+  </section>
+  <section>
     <h2>Signal performance (labeled forward returns)</h2>
     <div id="signalperf"></div>
   </section>
@@ -240,6 +260,8 @@ INDEX_HTML = """<!DOCTYPE html>
 </main>
 <script>
 const $ = id => document.getElementById(id);
+const fmtMoney = v => v == null ? "n/a" : (Number(v) < 0 ? "-$" : "$") +
+  Math.abs(Number(v)).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const fmtAge = s => s == null ? "—" : (s < 90 ? s.toFixed(0)+"s" : (s/60).toFixed(1)+"m");
 const fmtUsd = v => v == null ? "—" : "$" + Math.round(v).toLocaleString();
 const esc = s => String(s ?? "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
@@ -259,6 +281,9 @@ async function refresh() {
     card("Markets", s.counts.markets.toLocaleString()) +
     card("NegRisk groups", s.counts.neg_risk_groups.toLocaleString()) +
     card("Signals fired", s.counts.signals.toLocaleString()) +
+    card("Signal EV", fmtMoney(s.earnings.signal_ev)) +
+    card("Sim PnL", fmtMoney(s.earnings.labeled_sim_pnl)) +
+    card("Paper PnL", fmtMoney(s.earnings.paper_realized_pnl)) +
     card("Exec intents", s.counts.execution_intents.toLocaleString()) +
     card("Risk events", s.counts.risk_events.toLocaleString()) +
     card("Recon rows", s.counts.recon_rows.toLocaleString()) +
@@ -297,13 +322,24 @@ async function refresh() {
       <td class="num">${fmtAge(s.now - g.ts)}</td></tr>`).join("") + `</table>`
     : '<div class="empty">no signals fired yet — expected when no arb exists (system is signal-only)</div>';
 
+  $("earnings").innerHTML =
+    `<table><tr><th>metric</th><th class="num">value</th></tr>
+      <tr><td>Estimated signal value</td><td class="num">${fmtMoney(s.earnings.signal_ev)}</td></tr>
+      <tr><td>Labeled simulated PnL</td><td class="num">${fmtMoney(s.earnings.labeled_sim_pnl)}</td></tr>
+      <tr><td>Paper realized PnL</td><td class="num">${fmtMoney(s.earnings.paper_realized_pnl)}</td></tr>
+      <tr><td>Open paper cost</td><td class="num">${fmtMoney(s.earnings.paper_open_cost)}</td></tr>
+      <tr><td>Filled notional</td><td class="num">${fmtMoney(s.earnings.filled_notional)}</td></tr></table>`;
+
   $("signalperf").innerHTML = s.signal_perf.length ?
     `<table><tr><th>strategy</th><th>kind</th><th class="num">signals</th>
-       <th class="num">labeled</th><th class="num">hit rate</th><th class="num">avg fwd edge</th></tr>` +
+       <th class="num">labeled</th><th class="num">hit rate</th><th class="num">avg fwd edge</th>
+       <th class="num">signal EV</th><th class="num">sim PnL</th></tr>` +
     s.signal_perf.map(p => `<tr><td><span class="tag">${esc(p.strategy)}</span></td>
       <td>${esc(p.kind)}</td><td class="num">${p.n}</td><td class="num">${p.labeled}</td>
       <td class="num">${p.labeled ? (p.hit_rate*100).toFixed(0)+"%" : "—"}</td>
       <td class="num">${p.labeled ? (p.avg_outcome>=0?"+":"")+p.avg_outcome.toFixed(4) : "—"}</td>
+      <td class="num">${fmtMoney(p.signal_ev)}</td>
+      <td class="num">${fmtMoney(p.sim_pnl)}</td>
       </tr>`).join("") + `</table>`
     : '<div class="empty">no signals to evaluate yet</div>';
 

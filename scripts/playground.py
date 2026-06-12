@@ -193,6 +193,35 @@ def paper_fill(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
     return intent_id
 
 
+def label_outcome(conn: sqlite3.Connection, args: argparse.Namespace) -> int:
+    if args.all:
+        rows = conn.execute(
+            "SELECT signal_id, exec_sets FROM signal_log WHERE strategy=? ORDER BY signal_id",
+            (PLAYGROUND_STRATEGY,)).fetchall()
+    elif args.signal_id is None:
+        row = conn.execute(
+            "SELECT signal_id, exec_sets FROM signal_log WHERE strategy=? "
+            "ORDER BY signal_id DESC LIMIT 1",
+            (PLAYGROUND_STRATEGY,)).fetchone()
+        rows = [] if row is None else [row]
+    else:
+        row = conn.execute(
+            "SELECT signal_id, exec_sets FROM signal_log WHERE strategy=? AND signal_id=?",
+            (PLAYGROUND_STRATEGY, args.signal_id)).fetchone()
+        rows = [] if row is None else [row]
+
+    if not rows:
+        raise SystemExit("no playground signals found; run `scenario approved` first")
+
+    for row in rows:
+        pnl = float(args.outcome) * float(row["exec_sets"] or 0.0)
+        conn.execute(
+            "UPDATE signal_log SET outcome=?, pnl=? WHERE signal_id=?",
+            (round(float(args.outcome), 5), round(pnl, 4), row["signal_id"]))
+        print(f"signal_id={row['signal_id']} outcome={args.outcome:+.4f} sim_pnl=${pnl:+.2f}")
+    return len(rows)
+
+
 def reset(conn: sqlite3.Connection) -> None:
     signal_rows = conn.execute(
         "SELECT signal_id FROM signal_log WHERE strategy=?", (PLAYGROUND_STRATEGY,)).fetchall()
@@ -255,6 +284,12 @@ def build_parser() -> argparse.ArgumentParser:
     fill.add_argument("--size", type=float)
     fill.add_argument("--fee", type=float, default=0.0)
 
+    label = sub.add_parser("label-outcome", help="set synthetic forward outcome/PnL on playground signals")
+    label.add_argument("--signal-id", type=int)
+    label.add_argument("--outcome", type=float, default=0.02,
+                       help="signed forward edge per set; pnl = outcome * exec_sets")
+    label.add_argument("--all", action="store_true", help="apply to all playground signals")
+
     sub.add_parser("reset", help="delete synthetic playground records")
 
     tmpl = sub.add_parser("fee-audit-template", help="write a manual fee audit CSV template")
@@ -271,6 +306,8 @@ def main(argv: list[str] | None = None) -> int:
         asyncio.run(scenario(conn, settings, args))
     elif args.cmd == "paper-fill":
         paper_fill(conn, args)
+    elif args.cmd == "label-outcome":
+        label_outcome(conn, args)
     elif args.cmd == "reset":
         reset(conn)
     elif args.cmd == "fee-audit-template":

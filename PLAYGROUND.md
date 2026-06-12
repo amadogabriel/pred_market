@@ -54,6 +54,26 @@ populate `execution_fills` plus `positions`.
 .\.venv\Scripts\python.exe scripts\playground.py paper-fill
 ```
 
+## Simulated earnings
+
+Set a synthetic forward outcome on the latest playground signal:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\playground.py label-outcome --outcome 0.02
+```
+
+Or label all playground signals:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\playground.py label-outcome --all --outcome 0.02
+```
+
+The dashboard cards then show:
+
+- **Signal EV**: estimated opportunity value from `net_edge * exec_sets`
+- **Sim PnL**: labeled simulated PnL from `outcome * exec_sets`
+- **Paper PnL**: realized PnL from paper fills
+
 ## Fee audit template
 
 ```powershell
