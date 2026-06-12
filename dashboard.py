@@ -104,7 +104,7 @@ def _paper_portfolio(conn, settings) -> dict:
             "paper_pnl": 0.0,
             "sim_pnl": 0.0,
             "status": (
-                "paper eligible" if int(r["executable"]) > 0 else "research only"
+                "paper eligible" if int(r["executable"]) > 0 else "no executable size"
             ),
         }
         for r in conn.execute(
@@ -268,7 +268,10 @@ def _paper_portfolio(conn, settings) -> dict:
         "decisions": decisions[-PAPER_DECISION_LIMIT:],
         "strategy_selection": list(strategy_rows.values()),
         "positions": open_positions[:PAPER_DECISION_LIMIT],
-        "note": "Open positions are carried at cost; no live mark-to-market is available in state.db.",
+        "note": (
+            "Open positions are carried at cost; no live mark-to-market is available in state.db. "
+            "Rows with exec=0 are observations without executable sizing, not a strategy filter."
+        ),
     }
 
 
@@ -446,6 +449,14 @@ INDEX_HTML = """<!DOCTYPE html>
   .compact { grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); margin-bottom:16px; }
   .compact .card { padding:10px 12px; border-radius:8px; }
   .compact .card .value { font-size:20px; }
+  .tabs { display:flex; flex-wrap:wrap; gap:6px; margin:0 0 18px; border-bottom:1px solid var(--line); }
+  .tab-btn { appearance:none; border:1px solid transparent; border-bottom:none; background:transparent;
+    color:var(--muted); cursor:pointer; font:inherit; font-size:13px; padding:9px 12px;
+    border-radius:8px 8px 0 0; }
+  .tab-btn:hover { color:var(--txt); background:rgba(88,166,255,.08); }
+  .tab-btn.active { color:var(--txt); background:var(--panel); border-color:var(--line); }
+  .tab-panel { display:none; }
+  .tab-panel.active { display:block; }
   section { background:var(--panel); border:1px solid var(--line); border-radius:10px;
     padding:16px 18px; margin-bottom:18px; }
   section h2 { font-size:13px; margin:0 0 12px; color:var(--muted);
@@ -485,52 +496,72 @@ INDEX_HTML = """<!DOCTYPE html>
 </header>
 <main>
   <div class="grid cards" id="cards"></div>
-  <div class="two">
+  <nav class="tabs" aria-label="Dashboard views" role="tablist">
+    <button class="tab-btn" type="button" role="tab" data-tab="paper" aria-controls="tab-paper">Paper</button>
+    <button class="tab-btn" type="button" role="tab" data-tab="signals" aria-controls="tab-signals">Signals</button>
+    <button class="tab-btn" type="button" role="tab" data-tab="performance" aria-controls="tab-performance">Performance</button>
+    <button class="tab-btn" type="button" role="tab" data-tab="execution" aria-controls="tab-execution">Execution</button>
+    <button class="tab-btn" type="button" role="tab" data-tab="markets" aria-controls="tab-markets">Markets</button>
+    <button class="tab-btn" type="button" role="tab" data-tab="health" aria-controls="tab-health">Health</button>
+  </nav>
+  <div class="tab-panel" id="tab-paper" role="tabpanel">
     <section>
-      <h2>Component health</h2>
-      <div id="components"></div>
-    </section>
-    <section>
-      <h2>Recon (WS vs REST)</h2>
-      <div id="recon"></div>
-      <h2 style="margin-top:18px">Categories</h2>
-      <div id="categories"></div>
+      <h2>Paper portfolio ($50 bankroll)</h2>
+      <div id="paperportfolio"></div>
+      <h3>Strategy selection</h3>
+      <div id="strategyselect"></div>
+      <h3>Bet sizing / paper trades</h3>
+      <div id="betsizing"></div>
+      <h3>Open paper positions</h3>
+      <div id="paperpositions"></div>
     </section>
   </div>
-  <section>
-    <h2>Paper portfolio ($50 bankroll)</h2>
-    <div id="paperportfolio"></div>
-    <h3>Strategy selection</h3>
-    <div id="strategyselect"></div>
-    <h3>Bet sizing / paper trades</h3>
-    <div id="betsizing"></div>
-    <h3>Open paper positions</h3>
-    <div id="paperpositions"></div>
-  </section>
-  <section>
-    <h2>Recent signals</h2>
-    <div id="signals"></div>
-  </section>
-  <section>
-    <h2>Secondary diagnostics</h2>
-    <div id="earnings"></div>
-  </section>
-  <section>
-    <h2>Signal performance (labeled forward returns)</h2>
-    <div class="grid cards compact" id="signalstats"></div>
-    <h3>Strategy aggregates</h3>
-    <div id="strategyagg"></div>
-    <h3>Strategy / kind detail</h3>
-    <div id="signalperf"></div>
-  </section>
-  <section>
-    <h2>Recent execution</h2>
-    <div id="execution"></div>
-  </section>
-  <section>
-    <h2>Top tracked markets by liquidity</h2>
-    <div id="markets"></div>
-  </section>
+  <div class="tab-panel" id="tab-signals" role="tabpanel">
+    <section>
+      <h2>Recent signals</h2>
+      <div id="signals"></div>
+    </section>
+    <section>
+      <h2>Secondary diagnostics</h2>
+      <div id="earnings"></div>
+    </section>
+  </div>
+  <div class="tab-panel" id="tab-performance" role="tabpanel">
+    <section>
+      <h2>Signal performance (labeled forward returns)</h2>
+      <div class="grid cards compact" id="signalstats"></div>
+      <h3>Strategy aggregates</h3>
+      <div id="strategyagg"></div>
+      <h3>Strategy / kind detail</h3>
+      <div id="signalperf"></div>
+    </section>
+  </div>
+  <div class="tab-panel" id="tab-execution" role="tabpanel">
+    <section>
+      <h2>Recent execution</h2>
+      <div id="execution"></div>
+    </section>
+  </div>
+  <div class="tab-panel" id="tab-markets" role="tabpanel">
+    <section>
+      <h2>Top tracked markets by liquidity</h2>
+      <div id="markets"></div>
+    </section>
+  </div>
+  <div class="tab-panel" id="tab-health" role="tabpanel">
+    <div class="two">
+      <section>
+        <h2>Component health</h2>
+        <div id="components"></div>
+      </section>
+      <section>
+        <h2>Recon (WS vs REST)</h2>
+        <div id="recon"></div>
+        <h2 style="margin-top:18px">Categories</h2>
+        <div id="categories"></div>
+      </section>
+    </div>
+  </div>
 </main>
 <script>
 const $ = id => document.getElementById(id);
@@ -550,6 +581,27 @@ const extLink = (url, label, title) => url
 const tokenLinks = tokens => (tokens || []).map(t =>
   extLink(t.url, `${t.side}:${short(t.token_id, 8)}`, `${t.question || t.slug || "Polymarket market"}\n${t.token_id}`)
 ).join(" ");
+const tabButtons = Array.from(document.querySelectorAll(".tab-btn"));
+const tabPanels = Array.from(document.querySelectorAll(".tab-panel"));
+const tabNames = new Set(tabButtons.map(btn => btn.dataset.tab));
+
+function setTab(tabName) {
+  const active = tabNames.has(tabName) ? tabName : "paper";
+  tabButtons.forEach(btn => {
+    const isActive = btn.dataset.tab === active;
+    btn.classList.toggle("active", isActive);
+    btn.setAttribute("aria-selected", isActive ? "true" : "false");
+  });
+  tabPanels.forEach(panel => {
+    const isActive = panel.id === `tab-${active}`;
+    panel.classList.toggle("active", isActive);
+    panel.hidden = !isActive;
+  });
+  localStorage.setItem("pm-dashboard-tab", active);
+}
+
+tabButtons.forEach(btn => btn.addEventListener("click", () => setTab(btn.dataset.tab)));
+setTab(localStorage.getItem("pm-dashboard-tab") || "paper");
 
 function card(label, value, sub) {
   return `<div class="card"><div class="label">${label}</div>

@@ -111,3 +111,22 @@ def test_paper_portfolio_includes_any_executable_strategy(tmp_path):
     assert portfolio["selected_bets"] == 1
     assert portfolio["cash"] == 45.0
     assert portfolio["decisions"][0]["strategy"] == "not_allowed"
+
+
+def test_paper_portfolio_marks_zero_exec_rows_as_unsized(tmp_path):
+    conn = db.connect(tmp_path / "state.db")
+    _signal(
+        conn,
+        strategy="microstructure",
+        kind="ofi_pressure",
+        legs=[{"token_id": "A", "market_id": "MA", "side": "BUY", "price": 0.50, "size": 10}],
+        net_edge=0.02,
+        exec_sets=0.0,
+        outcome=0.01,
+        ts=1.0,
+    )
+
+    portfolio = dashboard._paper_portfolio(conn, _Settings())
+
+    assert portfolio["selected_bets"] == 0
+    assert portfolio["strategy_selection"][0]["status"] == "no executable size"
