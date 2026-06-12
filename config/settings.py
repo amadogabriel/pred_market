@@ -109,6 +109,7 @@ class Settings:
     # --- dashboard (read-only web UI) ---
     dashboard_host: str = field(default_factory=lambda: _env("PM_DASH_HOST", "127.0.0.1"))
     dashboard_port: int = field(default_factory=lambda: int(_env("PM_DASH_PORT", "8787")))
+    paper_portfolio_usd: float = field(default_factory=lambda: float(_env("PM_PAPER_PORTFOLIO_USD", "50")))
 
 
 settings = Settings()

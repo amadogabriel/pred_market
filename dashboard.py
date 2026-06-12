@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections import defaultdict
 from pathlib import Path
 
 from aiohttp import web
@@ -23,6 +24,7 @@ from pm.core import db
 log = logging.getLogger(__name__)
 
 STALE_AGE = 120.0  # seconds; matches monitor's component-staleness threshold
+PAPER_DECISION_LIMIT = 20
 
 
 def _event_log_status(settings) -> dict:
@@ -38,6 +40,199 @@ def _event_log_status(settings) -> dict:
         "day": day,
         "size_mb": round(st.st_size / 1_048_576, 3),
         "age_s": round(time.time() - st.st_mtime, 1),
+    }
+
+
+def _paper_portfolio(conn, settings) -> dict:
+    """Replay executable signal rows into a small read-only paper portfolio."""
+    bankroll = float(settings.paper_portfolio_usd)
+    allowed = set(settings.execution_strategies)
+    cash = bankroll
+    realized_pnl = 0.0
+    deployed_notional = 0.0
+    sold_notional = 0.0
+    positions: dict[str, dict] = {}
+    decisions: list[dict] = []
+    picked = defaultdict(lambda: {
+        "selected": 0, "notional": 0.0, "paper_pnl": 0.0, "sim_pnl": 0.0,
+    })
+
+    strategy_rows = {
+        (r["strategy"], r["kind"]): {
+            "strategy": r["strategy"],
+            "kind": r["kind"],
+            "signals": int(r["signals"]),
+            "executable": int(r["executable"]),
+            "selected": 0,
+            "notional": 0.0,
+            "paper_pnl": 0.0,
+            "sim_pnl": 0.0,
+            "status": (
+                "paper eligible" if r["strategy"] in allowed and int(r["executable"]) > 0
+                else "research only" if int(r["executable"]) == 0
+                else "not allowlisted"
+            ),
+        }
+        for r in conn.execute(
+            "SELECT strategy, kind, COUNT(*) signals, "
+            "SUM(CASE WHEN exec_sets > 0 THEN 1 ELSE 0 END) executable "
+            "FROM signal_log GROUP BY strategy, kind ORDER BY strategy, kind")
+    }
+
+    def add_decision(row, *, status: str, action: str, reason: str,
+                     sets: float = 0.0, notional: float = 0.0,
+                     cost_per_set: float = 0.0, paper_pnl: float = 0.0,
+                     sim_pnl: float = 0.0) -> None:
+        decisions.append({
+            "signal_id": row["signal_id"],
+            "strategy": row["strategy"],
+            "kind": row["kind"],
+            "action": action,
+            "status": status,
+            "reason": reason,
+            "sets": round(sets, 4),
+            "notional": round(notional, 4),
+            "cost_per_set": round(cost_per_set, 4),
+            "net_edge": round(float(row["net_edge"] or 0.0), 4),
+            "paper_pnl": round(paper_pnl, 4),
+            "sim_pnl": round(sim_pnl, 4),
+            "ts": row["ts"],
+        })
+
+    rows = conn.execute(
+        "SELECT signal_id, strategy, kind, group_id, legs_json, net_edge, "
+        "exec_sets, outcome, pnl, ts FROM signal_log "
+        "WHERE exec_sets > 0 ORDER BY ts, signal_id").fetchall()
+
+    for row in rows:
+        key = (row["strategy"], row["kind"])
+        if row["strategy"] not in allowed:
+            add_decision(row, status="skipped", action="skip",
+                         reason="strategy not in execution allowlist")
+            continue
+        if float(row["net_edge"] or 0.0) <= 0:
+            add_decision(row, status="skipped", action="skip",
+                         reason="non-positive edge")
+            continue
+
+        legs = json.loads(row["legs_json"] or "[]")
+        sides = {str(leg.get("side", "")).upper() for leg in legs}
+        exec_sets = float(row["exec_sets"] or 0.0)
+        outcome = row["outcome"]
+
+        if sides == {"BUY"}:
+            cost_per_set = sum(float(leg["price"]) for leg in legs)
+            if cost_per_set <= 0:
+                add_decision(row, status="skipped", action="buy", reason="bad quoted cost")
+                continue
+            sets = min(exec_sets, cash / cost_per_set if cash > 0 else 0.0)
+            if sets <= 1e-9:
+                add_decision(row, status="skipped", action="buy", reason="no cash left",
+                             cost_per_set=cost_per_set)
+                continue
+            notional = sets * cost_per_set
+            cash -= notional
+            deployed_notional += notional
+            for leg in legs:
+                token = str(leg["token_id"])
+                price = float(leg["price"])
+                pos = positions.setdefault(token, {
+                    "token_id": token, "market_id": leg.get("market_id"),
+                    "size": 0.0, "avg_price": 0.0,
+                })
+                old_size = pos["size"]
+                new_size = old_size + sets
+                pos["avg_price"] = ((old_size * pos["avg_price"]) + (sets * price)) / new_size
+                pos["size"] = new_size
+            reason = "cash cap" if sets < exec_sets else "quoted depth"
+            sim_pnl = float(outcome) * sets if outcome is not None else 0.0
+            add_decision(row, status="picked", action="buy", reason=reason,
+                         sets=sets, notional=notional, cost_per_set=cost_per_set,
+                         sim_pnl=sim_pnl)
+            picked[key]["selected"] += 1
+            picked[key]["notional"] += notional
+            picked[key]["sim_pnl"] += sim_pnl
+
+        elif sides == {"SELL"}:
+            proceeds_per_set = sum(float(leg["price"]) for leg in legs)
+            available_sets = min(
+                (positions.get(str(leg["token_id"]), {}).get("size", 0.0) for leg in legs),
+                default=0.0,
+            )
+            sets = min(exec_sets, available_sets)
+            if sets <= 1e-9:
+                add_decision(row, status="skipped", action="sell",
+                             reason="no paper inventory to close",
+                             cost_per_set=proceeds_per_set)
+                continue
+            notional = sets * proceeds_per_set
+            paper_pnl = 0.0
+            for leg in legs:
+                token = str(leg["token_id"])
+                price = float(leg["price"])
+                pos = positions[token]
+                paper_pnl += sets * (price - pos["avg_price"])
+                pos["size"] -= sets
+                if pos["size"] <= 1e-9:
+                    pos["size"] = 0.0
+                    pos["avg_price"] = 0.0
+            cash += notional
+            sold_notional += notional
+            realized_pnl += paper_pnl
+            reason = "inventory cap" if sets < exec_sets else "quoted depth"
+            sim_pnl = float(outcome) * sets if outcome is not None else 0.0
+            add_decision(row, status="picked", action="sell", reason=reason,
+                         sets=sets, notional=notional, cost_per_set=proceeds_per_set,
+                         paper_pnl=paper_pnl, sim_pnl=sim_pnl)
+            picked[key]["selected"] += 1
+            picked[key]["notional"] += notional
+            picked[key]["paper_pnl"] += paper_pnl
+            picked[key]["sim_pnl"] += sim_pnl
+
+        else:
+            add_decision(row, status="skipped", action="skip",
+                         reason="mixed or unsupported leg sides")
+
+    for key, values in picked.items():
+        if key in strategy_rows:
+            strategy_rows[key].update({
+                "selected": values["selected"],
+                "notional": round(values["notional"], 4),
+                "paper_pnl": round(values["paper_pnl"], 4),
+                "sim_pnl": round(values["sim_pnl"], 4),
+            })
+
+    open_positions = []
+    open_cost = 0.0
+    for pos in positions.values():
+        if pos["size"] <= 1e-9:
+            continue
+        cost = pos["size"] * pos["avg_price"]
+        open_cost += cost
+        open_positions.append({
+            "token_id": pos["token_id"],
+            "market_id": pos["market_id"],
+            "size": round(pos["size"], 4),
+            "avg_price": round(pos["avg_price"], 4),
+            "cost": round(cost, 4),
+        })
+
+    equity_at_cost = cash + open_cost
+    return {
+        "bankroll": round(bankroll, 4),
+        "cash": round(cash, 4),
+        "open_cost": round(open_cost, 4),
+        "equity_at_cost": round(equity_at_cost, 4),
+        "realized_pnl": round(realized_pnl, 4),
+        "total_pnl_at_cost": round(equity_at_cost - bankroll, 4),
+        "deployed_notional": round(deployed_notional, 4),
+        "sold_notional": round(sold_notional, 4),
+        "selected_bets": sum(v["selected"] for v in picked.values()),
+        "allowed_strategies": sorted(allowed),
+        "decisions": decisions[-PAPER_DECISION_LIMIT:],
+        "strategy_selection": list(strategy_rows.values()),
+        "positions": open_positions[:PAPER_DECISION_LIMIT],
+        "note": "Open positions are carried at cost; no live mark-to-market is available in state.db.",
     }
 
 
@@ -103,6 +298,7 @@ def query_state(conn, settings) -> dict:
         "filled_notional": round(scalar(
             "SELECT COALESCE(SUM(price * size),0) FROM execution_fills"), 4),
     }
+    paper_portfolio = _paper_portfolio(conn, settings)
 
     # category breakdown
     categories = [
@@ -143,6 +339,7 @@ def query_state(conn, settings) -> dict:
         "counts": counts,
         "recon": recon,
         "earnings": earnings,
+        "paper_portfolio": paper_portfolio,
         "categories": categories,
         "signals": signals,
         "signal_perf": signal_perf,
@@ -194,6 +391,8 @@ INDEX_HTML = """<!DOCTYPE html>
     padding:16px 18px; margin-bottom:18px; }
   section h2 { font-size:13px; margin:0 0 12px; color:var(--muted);
     text-transform:uppercase; letter-spacing:.6px; font-weight:600; }
+  section h3 { font-size:12px; margin:18px 0 8px; color:var(--muted);
+    text-transform:uppercase; letter-spacing:.5px; font-weight:600; }
   .two { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
   @media (max-width:820px){ .two{ grid-template-columns:1fr; } }
   table { width:100%; border-collapse:collapse; font-size:13px; }
@@ -238,11 +437,21 @@ INDEX_HTML = """<!DOCTYPE html>
     </section>
   </div>
   <section>
+    <h2>Paper portfolio ($50 bankroll)</h2>
+    <div id="paperportfolio"></div>
+    <h3>Strategy selection</h3>
+    <div id="strategyselect"></div>
+    <h3>Bet sizing / paper trades</h3>
+    <div id="betsizing"></div>
+    <h3>Open paper positions</h3>
+    <div id="paperpositions"></div>
+  </section>
+  <section>
     <h2>Recent signals</h2>
     <div id="signals"></div>
   </section>
   <section>
-    <h2>Simulated earnings</h2>
+    <h2>Secondary diagnostics</h2>
     <div id="earnings"></div>
   </section>
   <section>
@@ -277,13 +486,16 @@ async function refresh() {
   catch (e) { $("updated").innerHTML = '<span class="err">engine/db unreachable</span>'; return; }
 
   const hb = s.engine_heartbeat, el = s.event_log;
+  const pp = s.paper_portfolio;
   $("cards").innerHTML =
     card("Markets", s.counts.markets.toLocaleString()) +
     card("NegRisk groups", s.counts.neg_risk_groups.toLocaleString()) +
     card("Signals fired", s.counts.signals.toLocaleString()) +
-    card("Signal EV", fmtMoney(s.earnings.signal_ev)) +
-    card("Sim PnL", fmtMoney(s.earnings.labeled_sim_pnl)) +
-    card("Paper PnL", fmtMoney(s.earnings.paper_realized_pnl)) +
+    card("Portfolio", fmtMoney(pp.bankroll)) +
+    card("Paper PnL", fmtMoney(pp.total_pnl_at_cost), "at cost") +
+    card("Paper cash", fmtMoney(pp.cash)) +
+    card("Open cost", fmtMoney(pp.open_cost)) +
+    card("Paper bets", pp.selected_bets.toLocaleString()) +
     card("Exec intents", s.counts.execution_intents.toLocaleString()) +
     card("Risk events", s.counts.risk_events.toLocaleString()) +
     card("Recon rows", s.counts.recon_rows.toLocaleString()) +
@@ -311,6 +523,53 @@ async function refresh() {
      <div class="bar"><i style="width:${(c.n/maxCat*100).toFixed(1)}%"></i></div>`).join("")
     : '<div class="empty">no markets yet</div>';
 
+  $("paperportfolio").innerHTML =
+    `<table><tr><th>metric</th><th class="num">value</th></tr>
+      <tr><td>Starting bankroll</td><td class="num">${fmtMoney(pp.bankroll)}</td></tr>
+      <tr><td>Paper PnL</td><td class="num">${fmtMoney(pp.total_pnl_at_cost)}</td></tr>
+      <tr><td>Realized paper PnL</td><td class="num">${fmtMoney(pp.realized_pnl)}</td></tr>
+      <tr><td>Cash</td><td class="num">${fmtMoney(pp.cash)}</td></tr>
+      <tr><td>Open position cost</td><td class="num">${fmtMoney(pp.open_cost)}</td></tr>
+      <tr><td>Equity at cost</td><td class="num">${fmtMoney(pp.equity_at_cost)}</td></tr>
+      <tr><td>Deployed notional</td><td class="num">${fmtMoney(pp.deployed_notional)}</td></tr>
+      <tr><td>Sold notional</td><td class="num">${fmtMoney(pp.sold_notional)}</td></tr>
+      <tr><td>Allowed strategies</td><td class="num">${esc(pp.allowed_strategies.join(", ") || "none")}</td></tr></table>
+      <div class="empty">${esc(pp.note)}</div>`;
+
+  $("strategyselect").innerHTML = pp.strategy_selection.length ?
+    `<table><tr><th>strategy</th><th>kind</th><th>status</th><th class="num">signals</th>
+       <th class="num">exec</th><th class="num">picked</th><th class="num">notional</th>
+       <th class="num">paper PnL</th><th class="num">sim PnL</th></tr>` +
+    pp.strategy_selection.map(p => `<tr><td><span class="tag">${esc(p.strategy)}</span></td>
+      <td>${esc(p.kind)}</td><td>${esc(p.status)}</td>
+      <td class="num">${p.signals}</td><td class="num">${p.executable}</td>
+      <td class="num">${p.selected}</td><td class="num">${fmtMoney(p.notional)}</td>
+      <td class="num">${fmtMoney(p.paper_pnl)}</td><td class="num">${fmtMoney(p.sim_pnl)}</td></tr>`).join("") + `</table>`
+    : '<div class="empty">no strategy rows yet</div>';
+
+  $("betsizing").innerHTML = pp.decisions.length ?
+    `<table><tr><th>signal</th><th>strategy</th><th>kind</th><th>action</th><th>status</th>
+       <th>reason</th><th class="num">$/set</th><th class="num">sets</th>
+       <th class="num">notional</th><th class="num">edge</th><th class="num">paper PnL</th>
+       <th class="num">sim PnL</th></tr>` +
+    pp.decisions.map(d => `<tr><td>${d.signal_id}</td><td><span class="tag">${esc(d.strategy)}</span></td>
+      <td>${esc(d.kind)}</td><td>${esc(d.action)}</td><td>${esc(d.status)}</td>
+      <td>${esc(d.reason)}</td><td class="num">${fmtMoney(d.cost_per_set)}</td>
+      <td class="num">${Number(d.sets).toFixed(2)}</td><td class="num">${fmtMoney(d.notional)}</td>
+      <td class="num">${Number(d.net_edge).toFixed(4)}</td><td class="num">${fmtMoney(d.paper_pnl)}</td>
+      <td class="num">${fmtMoney(d.sim_pnl)}</td></tr>`).join("") + `</table>`
+    : '<div class="empty">no executable paper decisions yet</div>';
+
+  $("paperpositions").innerHTML = pp.positions.length ?
+    `<table><tr><th>token</th><th>market</th><th class="num">shares</th>
+       <th class="num">avg price</th><th class="num">cost</th></tr>` +
+    pp.positions.map(p => `<tr><td>${esc((p.token_id||"").slice(0,18))}</td>
+      <td>${esc((p.market_id||"").slice(0,18))}</td>
+      <td class="num">${Number(p.size).toFixed(2)}</td>
+      <td class="num">${Number(p.avg_price).toFixed(4)}</td>
+      <td class="num">${fmtMoney(p.cost)}</td></tr>`).join("") + `</table>`
+    : '<div class="empty">no open paper positions</div>';
+
   $("signals").innerHTML = s.signals.length ?
     `<table><tr><th>id</th><th>strategy</th><th>kind</th><th>group</th><th class="num">net edge</th>
        <th class="num">sets</th><th class="num">outcome</th><th class="num">age</th></tr>` +
@@ -324,11 +583,11 @@ async function refresh() {
 
   $("earnings").innerHTML =
     `<table><tr><th>metric</th><th class="num">value</th></tr>
-      <tr><td>Estimated signal value</td><td class="num">${fmtMoney(s.earnings.signal_ev)}</td></tr>
-      <tr><td>Labeled simulated PnL</td><td class="num">${fmtMoney(s.earnings.labeled_sim_pnl)}</td></tr>
-      <tr><td>Paper realized PnL</td><td class="num">${fmtMoney(s.earnings.paper_realized_pnl)}</td></tr>
-      <tr><td>Open paper cost</td><td class="num">${fmtMoney(s.earnings.paper_open_cost)}</td></tr>
-      <tr><td>Filled notional</td><td class="num">${fmtMoney(s.earnings.filled_notional)}</td></tr></table>`;
+      <tr><td>Signal EV at full quoted depth</td><td class="num">${fmtMoney(s.earnings.signal_ev)}</td></tr>
+      <tr><td>Labeler sim PnL at full quoted depth</td><td class="num">${fmtMoney(s.earnings.labeled_sim_pnl)}</td></tr>
+      <tr><td>Execution-fill realized PnL</td><td class="num">${fmtMoney(s.earnings.paper_realized_pnl)}</td></tr>
+      <tr><td>Execution-fill open cost</td><td class="num">${fmtMoney(s.earnings.paper_open_cost)}</td></tr>
+      <tr><td>Execution-fill notional</td><td class="num">${fmtMoney(s.earnings.filled_notional)}</td></tr></table>`;
 
   $("signalperf").innerHTML = s.signal_perf.length ?
     `<table><tr><th>strategy</th><th>kind</th><th class="num">signals</th>
