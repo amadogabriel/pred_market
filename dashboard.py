@@ -15,6 +15,7 @@ import logging
 import time
 from collections import defaultdict
 from pathlib import Path
+from urllib.parse import quote_plus
 
 from aiohttp import web
 
@@ -54,10 +55,15 @@ def _paper_portfolio(conn, settings) -> dict:
             row = conn.execute(
                 "SELECT slug, question FROM markets WHERE market_id=?", (market_id,)).fetchone()
             slug = str(row["slug"] or "") if row else ""
+            question = str(row["question"] or "") if row else ""
+            search_query = question or str(market_id)
             market_meta[market_id] = {
                 "slug": slug,
-                "question": str(row["question"] or "") if row else "",
-                "url": f"https://polymarket.com/event/{slug}" if slug else "",
+                "question": question,
+                "url": (
+                    f"https://polymarket.com/market/{slug}" if slug
+                    else f"https://polymarket.com/search?query={quote_plus(search_query)}"
+                ),
             }
         return market_meta[market_id]
 
@@ -77,7 +83,6 @@ def _paper_portfolio(conn, settings) -> dict:
         return out
 
     bankroll = float(settings.paper_portfolio_usd)
-    allowed = set(settings.execution_strategies)
     cash = bankroll
     realized_pnl = 0.0
     deployed_notional = 0.0
@@ -99,9 +104,7 @@ def _paper_portfolio(conn, settings) -> dict:
             "paper_pnl": 0.0,
             "sim_pnl": 0.0,
             "status": (
-                "paper eligible" if r["strategy"] in allowed and int(r["executable"]) > 0
-                else "research only" if int(r["executable"]) == 0
-                else "not allowlisted"
+                "paper eligible" if int(r["executable"]) > 0 else "research only"
             ),
         }
         for r in conn.execute(
@@ -138,10 +141,6 @@ def _paper_portfolio(conn, settings) -> dict:
 
     for row in rows:
         key = (row["strategy"], row["kind"])
-        if row["strategy"] not in allowed:
-            add_decision(row, status="skipped", action="skip",
-                         reason="strategy not in execution allowlist")
-            continue
         if float(row["net_edge"] or 0.0) <= 0:
             add_decision(row, status="skipped", action="skip",
                          reason="non-positive edge")
@@ -265,7 +264,7 @@ def _paper_portfolio(conn, settings) -> dict:
         "deployed_notional": round(deployed_notional, 4),
         "sold_notional": round(sold_notional, 4),
         "selected_bets": sum(v["selected"] for v in picked.values()),
-        "allowed_strategies": sorted(allowed),
+        "strategy_scope": "all executable signals",
         "decisions": decisions[-PAPER_DECISION_LIMIT:],
         "strategy_selection": list(strategy_rows.values()),
         "positions": open_positions[:PAPER_DECISION_LIMIT],
@@ -519,7 +518,7 @@ const esc = s => {
 };
 const short = (s, n=18) => String(s ?? "").slice(0, n);
 const extLink = (url, label, title) => url
-  ? `<a class="ext" href="${esc(url)}" target="_blank" rel="noreferrer" title="${esc(title || url)}">${esc(label)}</a>`
+  ? `<a class="ext" href="${esc(url)}" title="${esc(title || url)}">${esc(label)}</a>`
   : esc(label);
 const tokenLinks = tokens => (tokens || []).map(t =>
   extLink(t.url, `${t.side}:${short(t.token_id, 8)}`, `${t.question || t.slug || "Polymarket market"}\n${t.token_id}`)
@@ -583,7 +582,7 @@ async function refresh() {
       <tr><td>Equity at cost</td><td class="num">${fmtMoney(pp.equity_at_cost)}</td></tr>
       <tr><td>Deployed notional</td><td class="num">${fmtMoney(pp.deployed_notional)}</td></tr>
       <tr><td>Sold notional</td><td class="num">${fmtMoney(pp.sold_notional)}</td></tr>
-      <tr><td>Allowed strategies</td><td class="num">${esc(pp.allowed_strategies.join(", ") || "none")}</td></tr></table>
+      <tr><td>Strategy scope</td><td class="num">${esc(pp.strategy_scope)}</td></tr></table>
       <div class="empty">${esc(pp.note)}</div>`;
 
   $("strategyselect").innerHTML = pp.strategy_selection.length ?

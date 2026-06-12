@@ -59,7 +59,8 @@ populate `execution_fills` plus `positions`.
 The dashboard's primary earnings view is a read-only paper portfolio replay:
 
 - starts with `$50` by default (`PM_PAPER_PORTFOLIO_USD` overrides it)
-- only picks strategies in `PM_EXECUTION_STRATEGIES`
+- picks every signal with `exec_sets > 0` regardless of the live execution
+  allowlist
 - sizes each picked signal by quoted contract prices, available cash, and
   quoted depth
 - closes existing paper inventory on SELL signals

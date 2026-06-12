@@ -11,14 +11,14 @@ from pm.core import db
 @dataclass(frozen=True)
 class _Settings:
     paper_portfolio_usd: float = 50.0
-    execution_strategies: frozenset[str] = frozenset({"struct_arb"})
 
 
 def _signal(conn, *, kind: str, legs: list[dict], exec_sets: float,
-            net_edge: float, outcome: float, ts: float) -> int:
+            net_edge: float, outcome: float, ts: float,
+            strategy: str = "struct_arb") -> int:
     signal_id = db.log_signal(
         conn,
-        strategy="struct_arb",
+        strategy=strategy,
         kind=kind,
         group_id="G1",
         legs=legs,
@@ -88,27 +88,26 @@ def test_paper_portfolio_replay_sizes_against_total_bankroll(tmp_path):
     assert portfolio["total_pnl_at_cost"] == pytest.approx(3.0)
     assert portfolio["realized_pnl"] == pytest.approx(3.0)
     assert portfolio["decisions"][0]["reason"] == "cash cap"
-    assert portfolio["decisions"][0]["tokens"][0]["url"] == "https://polymarket.com/event/market-a"
-    assert portfolio["positions"][0]["url"] == "https://polymarket.com/event/market-a"
+    assert portfolio["strategy_scope"] == "all executable signals"
+    assert portfolio["decisions"][0]["tokens"][0]["url"] == "https://polymarket.com/market/market-a"
+    assert portfolio["positions"][0]["url"] == "https://polymarket.com/market/market-a"
 
 
-def test_paper_portfolio_respects_strategy_allowlist(tmp_path):
+def test_paper_portfolio_includes_any_executable_strategy(tmp_path):
     conn = db.connect(tmp_path / "state.db")
-    db.log_signal(
+    _signal(
         conn,
         strategy="not_allowed",
         kind="test",
-        group_id="G1",
         legs=[{"token_id": "A", "market_id": "MA", "side": "BUY", "price": 0.50, "size": 10}],
-        gross_edge=0.02,
-        fees=0.0,
         net_edge=0.02,
         exec_sets=10.0,
-        features={},
+        outcome=0.01,
+        ts=1.0,
     )
 
     portfolio = dashboard._paper_portfolio(conn, _Settings())
 
-    assert portfolio["selected_bets"] == 0
-    assert portfolio["cash"] == 50.0
-    assert portfolio["decisions"][0]["reason"] == "strategy not in execution allowlist"
+    assert portfolio["selected_bets"] == 1
+    assert portfolio["cash"] == 45.0
+    assert portfolio["decisions"][0]["strategy"] == "not_allowed"
