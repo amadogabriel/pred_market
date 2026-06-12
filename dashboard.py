@@ -349,6 +349,24 @@ def query_state(conn, settings) -> dict:
         "FROM signal_log ORDER BY ts DESC LIMIT 15")]
 
     # signal performance by strategy/kind (labeler outcomes)
+    signal_summary = dict(conn.execute(
+        "SELECT COUNT(*) signals, "
+        "SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END) labeled, "
+        "AVG(outcome) avg_outcome, "
+        "AVG(CASE WHEN outcome > 0 THEN 1.0 WHEN outcome IS NOT NULL THEN 0.0 END) hit_rate, "
+        "COALESCE(SUM(net_edge * exec_sets),0) signal_ev, "
+        "COALESCE(SUM(CASE WHEN pnl IS NOT NULL THEN pnl ELSE 0 END),0) sim_pnl, "
+        "SUM(CASE WHEN exec_sets > 0 THEN 1 ELSE 0 END) executable "
+        "FROM signal_log").fetchone())
+    signal_by_strategy = [dict(r) for r in conn.execute(
+        "SELECT strategy, COUNT(*) signals, "
+        "SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END) labeled, "
+        "AVG(outcome) avg_outcome, "
+        "AVG(CASE WHEN outcome > 0 THEN 1.0 WHEN outcome IS NOT NULL THEN 0.0 END) hit_rate, "
+        "COALESCE(SUM(net_edge * exec_sets),0) signal_ev, "
+        "COALESCE(SUM(CASE WHEN pnl IS NOT NULL THEN pnl ELSE 0 END),0) sim_pnl, "
+        "SUM(CASE WHEN exec_sets > 0 THEN 1 ELSE 0 END) executable "
+        "FROM signal_log GROUP BY strategy ORDER BY strategy")]
     signal_perf = [dict(r) for r in conn.execute(
         "SELECT strategy, kind, COUNT(*) n, "
         "SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END) labeled, "
@@ -378,6 +396,8 @@ def query_state(conn, settings) -> dict:
         "paper_portfolio": paper_portfolio,
         "categories": categories,
         "signals": signals,
+        "signal_summary": signal_summary,
+        "signal_by_strategy": signal_by_strategy,
         "signal_perf": signal_perf,
         "execution": execution,
         "top_markets": top_markets,
@@ -423,6 +443,9 @@ INDEX_HTML = """<!DOCTYPE html>
   .card .label { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.6px; }
   .card .value { font-size:26px; font-weight:650; margin-top:4px; }
   .card .value small { font-size:13px; color:var(--muted); font-weight:400; }
+  .compact { grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); margin-bottom:16px; }
+  .compact .card { padding:10px 12px; border-radius:8px; }
+  .compact .card .value { font-size:20px; }
   section { background:var(--panel); border:1px solid var(--line); border-radius:10px;
     padding:16px 18px; margin-bottom:18px; }
   section h2 { font-size:13px; margin:0 0 12px; color:var(--muted);
@@ -494,6 +517,10 @@ INDEX_HTML = """<!DOCTYPE html>
   </section>
   <section>
     <h2>Signal performance (labeled forward returns)</h2>
+    <div class="grid cards compact" id="signalstats"></div>
+    <h3>Strategy aggregates</h3>
+    <div id="strategyagg"></div>
+    <h3>Strategy / kind detail</h3>
     <div id="signalperf"></div>
   </section>
   <section>
@@ -637,6 +664,31 @@ async function refresh() {
       <tr><td>Execution-fill realized PnL</td><td class="num">${fmtMoney(s.earnings.paper_realized_pnl)}</td></tr>
       <tr><td>Execution-fill open cost</td><td class="num">${fmtMoney(s.earnings.paper_open_cost)}</td></tr>
       <tr><td>Execution-fill notional</td><td class="num">${fmtMoney(s.earnings.filled_notional)}</td></tr></table>`;
+
+  const ss = s.signal_summary;
+  $("signalstats").innerHTML =
+    card("Total signals", Number(ss.signals || 0).toLocaleString()) +
+    card("Labeled", Number(ss.labeled || 0).toLocaleString(),
+         `${Number(ss.signals || 0) ? (ss.labeled / ss.signals * 100).toFixed(0) : 0}%`) +
+    card("Executable", Number(ss.executable || 0).toLocaleString()) +
+    card("Hit rate", ss.labeled ? (ss.hit_rate * 100).toFixed(0) + "%" : "—") +
+    card("Avg fwd edge", ss.labeled ? (ss.avg_outcome >= 0 ? "+" : "") + ss.avg_outcome.toFixed(4) : "—") +
+    card("Signal EV", fmtMoney(ss.signal_ev)) +
+    card("Sim PnL", fmtMoney(ss.sim_pnl));
+
+  $("strategyagg").innerHTML = s.signal_by_strategy.length ?
+    `<table><tr><th>strategy</th><th class="num">signals</th><th class="num">exec</th>
+       <th class="num">labeled</th><th class="num">coverage</th><th class="num">hit rate</th>
+       <th class="num">avg fwd edge</th><th class="num">signal EV</th><th class="num">sim PnL</th></tr>` +
+    s.signal_by_strategy.map(p => `<tr><td><span class="tag">${esc(p.strategy)}</span></td>
+      <td class="num">${p.signals}</td><td class="num">${p.executable}</td>
+      <td class="num">${p.labeled}</td>
+      <td class="num">${p.signals ? (p.labeled / p.signals * 100).toFixed(0)+"%" : "—"}</td>
+      <td class="num">${p.labeled ? (p.hit_rate*100).toFixed(0)+"%" : "—"}</td>
+      <td class="num">${p.labeled ? (p.avg_outcome>=0?"+":"")+p.avg_outcome.toFixed(4) : "—"}</td>
+      <td class="num">${fmtMoney(p.signal_ev)}</td>
+      <td class="num">${fmtMoney(p.sim_pnl)}</td></tr>`).join("") + `</table>`
+    : '<div class="empty">no strategy aggregates yet</div>';
 
   $("signalperf").innerHTML = s.signal_perf.length ?
     `<table><tr><th>strategy</th><th>kind</th><th class="num">signals</th>
