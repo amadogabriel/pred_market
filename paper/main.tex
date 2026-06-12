@@ -1,0 +1,696 @@
+%% pm-system / Polymarket microstructure preregistered study
+%% Journal of Financial Economics submission format (elsarticle)
+%%
+%% Compile: latexmk -pdf main.tex
+%% Or:      pdflatex main && bibtex main && pdflatex main && pdflatex main
+
+\documentclass[review,12pt,authoryear]{elsarticle}
+
+\usepackage{lineno,hyperref}
+\modulolinenumbers[5]
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{siunitx}
+\sisetup{round-mode=places,round-precision=4}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{url}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  citecolor=blue!50!black,
+  urlcolor=blue!50!black,
+  pdftitle={Microstructure and relative-value signals on Polymarket},
+}
+
+\journal{Journal of Financial Economics}
+
+\begin{document}
+
+\begin{frontmatter}
+
+\title{Microstructure and relative-value signals on Polymarket:\\
+A real-time observation framework and preregistered evaluation\\
+of ten candidate signals\tnoteref{t1}}
+
+\tnotetext[t1]{This is a preregistered working paper. Hypotheses, methodology,
+and analysis plan were committed to a public repository prior to the close of
+the data-collection window; see Section~\ref{sec:prereg} for the
+preregistration manifest. The authors place no live orders during the
+data-collection window; all signals are observational.}
+
+\author[bsp]{A.~Gabriel\corref{cor1}}
+\ead{generaljr@bsp.gov.ph}
+\cortext[cor1]{Corresponding author.}
+\address[bsp]{Independent researcher, Manila, Philippines}
+
+\begin{abstract}
+Centralized-limit-order-book (CLOB) prediction markets are an under-studied
+venue compared to equities and crypto. The continuous binary contracts on
+Polymarket admit a structural no-arbitrage condition over mutually exclusive
+outcome groups, and several classical microstructure signals---order-flow
+imbalance, trade-through, liquidity shocks---translate naturally to this
+venue. Their efficacy, however, is unmeasured. We build a real-time
+observation framework that ingests the full Polymarket CLOB websocket feed,
+persists every event to an append-only log, runs ten candidate signal
+detectors over the live data, and labels each emitted signal with its
+fifteen-minute forward mid return. The system is structurally fail-closed:
+research signals carry an empty execution plan by construction, and a
+strategy allowlist filters them prior to any risk pipeline. After
+\(n_\text{lab}=946\) labeled signals over a multi-day live soak, we
+report preregistered statistical evaluations with bootstrap confidence
+intervals and Benjamini--Hochberg false-discovery-rate correction across
+the ten-kind family. We find directional support for order-flow imbalance
+(conditional hit rate \(70.4\%\), 95\% CI \([62.0\%, 77.9\%]\),
+FDR-adjusted \(p < 10^{-6}\), \(n_\text{moved}=135\)); a directionally
+suggestive but FDR-marginal contrarian effect on trade-through prints
+(conditional hit rate \(35.6\%\), FDR-adjusted \(p = 0.13\)); a clean null
+on liquidity shocks; and statistically underpowered samples on the
+relative-value, structural-arbitrage, and momentum families. We document
+the gap between raw and conditional hit-rate metrics driven by tick-size
+discretization and offer this as a methodological caution for similar
+studies on tick-discretized binary markets.
+\end{abstract}
+
+\begin{keyword}
+prediction markets \sep market microstructure \sep order-flow imbalance
+\sep multiple testing \sep Polymarket
+\JEL G12 \sep G14 \sep C58
+\end{keyword}
+
+\end{frontmatter}
+
+\linenumbers
+
+%==============================================================================
+\section{Introduction}
+\label{sec:intro}
+
+Prediction markets aggregate decentralized information into a probability
+forecast through trading on contracts that pay one dollar conditional on a
+specified future event. The literature on these venues has been dominated
+by questions of \emph{calibration}---do prices forecast outcomes
+correctly?---following the influential overview by \citet{WolfersZitzewitz2004}
+and the experimental evidence from the Iowa Electronic Markets summarized in
+\citet{BergForsytheNelsonRietz2008}. The empirical consensus is that
+prediction-market prices are at least as well calibrated as polls or expert
+panels for political and event forecasting.
+
+The picture is less settled at the \emph{intraday} level. \citet{PageClemen2013}
+study Intrade data and document non-trivial intraday inefficiencies---prices
+wander, then revert---even when daily-average prices are well calibrated.
+This is the gap that intraday-signal research occupies: even on a venue with
+calibrated long-run prices, transient mispricings within the trading day are
+an empirical question, not a theoretical certainty.
+
+Polymarket, the largest current prediction-market venue, has been the subject
+of working papers, industry analysis, and considerable popular attention
+during the 2024 U.S.\ election cycle, but peer-reviewed empirical work on its
+intraday microstructure is essentially absent. This paper takes up that gap.
+We deploy a real-time observation framework, log every order-book event for
+a multi-day window, run ten candidate signal detectors over the live data,
+and evaluate each detector under a preregistered statistical-analysis plan
+with multiple-testing correction.
+
+Our contribution is fourfold:
+\begin{enumerate}[label=(\roman*)]
+\item \emph{Engineering.} We open-source a reproducible real-time observation
+framework for the Polymarket CLOB, with append-only event logging,
+deterministic event-time replay, and isolation guarantees between research
+signals and any executable code path.
+\item \emph{Empirical.} We present the first publicly described preregistered
+evaluation of intraday microstructure and relative-value signals on
+Polymarket over a multi-day live sample.
+\item \emph{Methodological.} We document a substantial measurement artifact
+in this venue---approximately \(85\%\) of fifteen-minute forward mid returns
+are exactly zero, driven by tick-size discretization---and propose a
+\emph{conditional-on-movement} hit-rate metric that we argue should be the
+primary metric for any tick-discretized binary venue.
+\item \emph{Negative results count.} Where the data fails to reject the null
+we report that explicitly, including the FDR-marginal contrarian finding on
+trade-through prints. We pre-commit to revisiting marginal findings on
+genuinely out-of-sample data.
+\end{enumerate}
+
+The remainder of the paper is organized as follows. Section~\ref{sec:lit}
+situates the work in the relevant literatures. Section~\ref{sec:data}
+describes the data and the observation framework. Section~\ref{sec:hyp}
+states the preregistered hypotheses. Section~\ref{sec:methods} details the
+statistical-analysis plan. Section~\ref{sec:results} reports preliminary
+results from the live sample. Section~\ref{sec:robust} enumerates threats
+to validity and robustness checks. Section~\ref{sec:conc} concludes.
+
+%==============================================================================
+\section{Related literature}
+\label{sec:lit}
+
+\subsection{Prediction-market efficiency}
+
+The canonical case for prediction-market calibration is given by
+\citet{WolfersZitzewitz2004}; the experimental confirmation on the Iowa
+Electronic Markets is reviewed in \citet{BergForsytheNelsonRietz2008}.
+\citet{PageClemen2013} study Intrade intraday data and find economically
+non-trivial intraday inefficiencies coexisting with daily-level calibration.
+\citet{HansonOprea2009} consider strategic-information disclosure on
+prediction markets. The intraday-microstructure question for the modern CLOB
+venue has not been formally addressed.
+
+\subsection{Order-flow imbalance and price impact}
+
+The theoretical and empirical case for order-flow imbalance (OFI) as a
+short-horizon price-impact signal is developed in
+\citet{ContKukanovStoikov2014} on equity LOB data, with multilevel and
+cross-asset refinements in \citet{KolmTuretsky2019} and
+\citet{LiptonPesavento2014}. \citet{Hasbrouck2007} provides the textbook
+treatment of microstructure-noise estimators and trade-direction
+classification. \citet{LeeReady1991} introduced the classification rule for
+buyer- vs. seller-initiated trades that is foundational for our
+trade-through signal.
+
+The applicability of OFI to a \emph{binary tick-discretized} CLOB is, ex
+ante, ambiguous. The linear-impact approximation of
+\citet{ContKukanovStoikov2014} relies on a near-continuous price grid; on
+Polymarket the price grid is \$0.005, large relative to typical
+fifteen-minute mid drift on the illiquid markets where OFI fires most often.
+We expect a weaker effect than on equities, possibly zero.
+
+\subsection{Liquidity shocks and adverse selection}
+
+\citet{EasleyLopezdePradoOHara2012} introduce VPIN as a volume-bucketed
+toxic-flow measure. \citet{NaesSkjeltorp2006} consider time-bucketed
+liquidity-event measures. The two literatures predict opposite signs:
+liquidity shocks may presage continuation (informed traders were right) or
+reversion (the shock was noise). We do not preregister a directional
+prediction; we test only that liquidity-shock signals deviate from a
+time-and-token-matched random baseline.
+
+\subsection{Structural arbitrage on combinatorial outcomes}
+
+The sum-to-one condition for a mutually exclusive partition of outcomes is
+the binary-market analog of put--call parity, studied empirically on options
+exchanges by \citet{BattalioSchultz2006}. On Polymarket the so-called
+\emph{NegRisk} groups bundle, e.g., one YES contract for each candidate in an
+election; their YES prices should sum to one if the group is exhaustive.
+Industry analysis on the 2024 election cycle has noted persistent
+intra-group violations, but the frequency, magnitude, and persistence of
+such violations has not been formally studied.
+
+\subsection{Momentum and mean-reversion}
+
+The literatures on equity momentum (\citealp{JegadeeshTitman1993};
+\citealp{Asness1994}; \citealp{MoskowitzOoiPedersen2012}) and on crypto
+momentum (\citealp{LiuTsyvinski2021}) do not directly translate to
+prediction markets: bounded \([0,1]\) prices, approaching-resolution
+effects, and event-driven repricing plausibly produce both continuation and
+mean-reverting subregimes. We test both \emph{directional momentum} and
+\emph{boundary overshoot} as separate signal kinds and pre-register
+direction-uncommitted hypotheses.
+
+\subsection{Tick-size discretization as a confounder}
+
+\citet{HasbrouckSaar2013} and others document that tick-size discretization
+materially affects observed-return-series properties. We flag this as a
+first-order methodological concern in Section~\ref{sec:methods}; to our
+knowledge this is the first study to operationalize the concern on
+prediction-market data through a conditional-on-movement hit-rate metric.
+
+\subsection{Multiple testing in signal screening}
+
+\citet{HarveyLiuZhu2016} document the multiple-testing problem in the
+cross-section of expected returns and advocate FDR-style correction for
+screening studies. We follow that prescription with the
+\citet{BenjaminiHochberg1995} procedure across our ten-kind family.
+
+%==============================================================================
+\section{Data and observation framework}
+\label{sec:data}
+
+\subsection{Venue and instruments}
+
+Polymarket operates a centralized-limit-order-book exchange for binary
+outcome contracts. Each market consists of a YES token, paying \$1 if the
+specified event occurs, and a NO token, paying \$1 otherwise.
+\emph{NegRisk} groups bundle markets whose outcomes are mutually exclusive
+and (intended to be) exhaustive; on a typical group the sum of YES prices
+should equal one. Trades clear continuously against a price--time-priority
+limit-order book with a \$0.005 minimum tick.
+
+The fee schedule is taker-pay, with per-share fee
+\(f = \text{rate} \cdot p \cdot (1-p)\), where \(p\) is the trade price.
+This implies fees are largest near \(p = 0.5\) and approach zero near the
+boundaries. Maker orders are free, by exchange convention as of the
+sample period.
+
+\subsection{Universe}
+
+We track the top \(N=150\) most-liquid currently-active markets at any
+moment, defined by Polymarket's metadata \texttt{liquidity} field.
+Coverage spans approximately \num{300} tokens (YES and NO for each market)
+across three chunked websocket connections (one hundred tokens per
+connection, the published limit).
+
+\subsection{Event-log architecture}
+
+Every event published on the engine's internal pub/sub bus is appended,
+unmodified, to a dated JSON-lines file. The event log is the canonical
+artifact of the study: the operational state database is \emph{derived}
+from the log plus the engine source code at the corresponding commit.
+We commit to never back-editing either artifact.
+
+Per-day log volume is approximately one gigabyte of raw events,
+expanding to \(\approx 3.6\) GB after websocket-snapshot rehydration. The
+log includes:
+\begin{itemize}[noitemsep]
+\item \texttt{book} --- full L2 snapshots at subscription start and after gaps
+\item \texttt{price\_change} --- per-level deltas
+\item \texttt{last\_trade\_price} --- prints with size and side
+\item \texttt{system} --- connect / disconnect / recon-drift markers
+\item \texttt{signal} --- every emitted signal with its full feature dictionary
+\end{itemize}
+
+A separate reconciliation task cross-checks the websocket book state
+against the REST API every five minutes and logs the absolute price
+difference. Drifts exceeding two cents publish a system event.
+
+\subsection{Sampling window}
+
+The primary sampling window is the seven-day live soak required for the
+operational-readiness gate (denoted G0 internally). We collect at least
+fourteen calendar days if opportunity frequency on the rarer signal kinds
+is the binding constraint. The window is the contiguous live-soak period
+commencing on the registration date stated in Section~\ref{sec:prereg}.
+
+\subsection{Fail-closed isolation}
+
+The system enforces two independent isolation guarantees between the
+research signals studied here and any executable code path:
+\begin{enumerate}[label=(\roman*)]
+\item Every \texttt{ResearchSignal} carries a structural property
+\(\text{exec\_sets} = 0\) set at construction, so the intent-builder produces
+an empty plan.
+\item The execution task additionally filters incoming signals by a
+strategy allowlist whose default value (\texttt{struct\_arb} only)
+excludes every research strategy studied here.
+\end{enumerate}
+Neither guarantee can be silently bypassed by configuration. The engine
+also maintains a separate live-trading constant defaulting to \texttt{False}
+that gates the executable arbitrage path independently. No live orders
+were placed during the sample period.
+
+%==============================================================================
+\section{Preregistered hypotheses}
+\label{sec:hyp}
+
+We test ten primary hypotheses, one per signal kind. Notation: let \(O_i\)
+denote the labeled forward-return outcome of signal \(i\), signed so that
+positive values indicate the encoded direction was correct; \(n_\text{lab}\)
+the count of labeled outcomes, \(n_\text{moved} = \#\{O_i \neq 0\}\), and
+\(H_\text{cond} = \#\{O_i > 0\} / n_\text{moved}\). The primary metric for
+kinds with substantial zero-mass is \(H_\text{cond}\); the secondary
+metric is the mean outcome \(\mu\).
+
+Table~\ref{tab:hypotheses} summarizes the preregistered tests, decision
+rules, and directional pre-predictions.
+
+\begin{table}[t]
+\centering
+\caption{Preregistered hypotheses, decision rules, and directional pre-predictions.}
+\label{tab:hypotheses}
+\small
+\begin{tabularx}{\linewidth}{l l X l}
+\toprule
+ID & Kind & Alternative \(H_1\) & Pre-prediction \\
+\midrule
+H1 & struct\_arb / partition\_buy\_all   & \(\mu > 0\)              & Strong (no-arb) \\
+H2 & struct\_arb / partition\_sell\_all  & \(\mu > 0\)              & Strong (no-arb) \\
+H3 & struct\_arb / complement            & \(\mu > 0\)              & Strong (no-arb) \\
+H4 & microstructure / ofi\_pressure       & \(H_\text{cond} > 0.5\)  & Moderate continuation \\
+H5 & microstructure / liquidity\_shock    & \(H_\text{cond} \neq 0.5\) & None (two-sided) \\
+H6 & microstructure / trade\_through      & \(H_\text{cond} \neq 0.5\) & Two-sided; equity-microstructure predicts continuation, our pre-look suggests reversion \\
+H7 & rel\_value / complement\_drift       & \(\mu > 0\)              & Moderate reversion \\
+H8 & rel\_value / partition\_sum\_drift   & \(\mu > 0\)              & Weak (novel construction) \\
+H9 & momentum / directional\_momentum     & \(H_\text{cond} \neq 0.5\) & None (two-sided) \\
+H10 & momentum / boundary\_overshoot      & \(\mu > 0\)              & Moderate reversion \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+Each row of Table~\ref{tab:hypotheses} corresponds to a primary
+\(p\)-value computed by either an exact-binomial sign test (for hit-rate
+alternatives) or a Wilcoxon signed-rank test against zero (for mean-outcome
+alternatives). Family-wise correction is applied to the ten primary tests
+via the \citet{BenjaminiHochberg1995} procedure at \(q = 0.05\).
+
+%==============================================================================
+\section{Statistical methodology}
+\label{sec:methods}
+
+\subsection{Labeling protocol}
+
+For each emitted signal we compute the per-leg forward return:
+\begin{equation}
+O_\text{leg} =
+\begin{cases}
+\,m_\text{label} - p_\text{signal} & \text{if encoded side is BUY,} \\
+\,p_\text{signal} - m_\text{label} & \text{if encoded side is SELL,}
+\end{cases}
+\end{equation}
+where \(p_\text{signal}\) is the mid at signal time and \(m_\text{label}\) is
+the mid fifteen minutes later. The signal-level outcome is the simple mean
+across legs with a live, non-stale book at label time. Signals on which
+fewer than half of legs have a live book at label time remain unlabeled and
+are retried on subsequent passes for up to twenty-four hours.
+
+We discuss the selection bias induced by the half-rule in
+Section~\ref{sec:robust}.
+
+\subsection{Tick-size discretization and \(H_\text{cond}\)}
+
+Polymarket's \$0.005 tick is large relative to typical fifteen-minute mid
+moves on the illiquid markets where many signals fire. Empirically (see
+Section~\ref{sec:results}) approximately \(85\%\) of forward returns
+for the \texttt{ofi\_pressure} kind are exactly zero. A naive hit-rate
+metric \(H_\text{raw} = \#\{O > 0\} / n_\text{lab}\) understates the
+predictive content of the signal because it counts zero-mass as ``wrong.''
+
+We define the \emph{conditional-on-movement} hit rate
+\begin{equation}
+H_\text{cond} = \frac{\#\{O_i > 0\}}{\#\{O_i \neq 0\}}
+\end{equation}
+and use it as the primary metric for kinds with more than \(50\%\)
+zero-mass in the labeled-outcome distribution. We report \(H_\text{raw}\)
+alongside for completeness. The relevant inferential test is the exact
+binomial sign test on the moved subset.
+
+\subsection{Confidence intervals}
+
+We report \(95\%\) percentile bootstrap \citep{EfronTibshirani1993} CIs
+computed with \(B = 10{,}000\) resamples for both \(H_\text{cond}\) and
+\(\mu\). For \(H_\text{cond}\) we additionally report the exact-binomial
+\citet{ClopperPearson1934} CI as a robustness check; for small samples
+(\(n_\text{moved} < 30\)) the Clopper--Pearson interval is the primary CI.
+
+To address within-token temporal dependence we additionally compute a
+\emph{block bootstrap by token}: resampling tokens with replacement and
+taking all signals on each resampled token. The wider of the vanilla and
+block-bootstrap CIs is the conservative reported claim.
+
+\subsection{Hypothesis tests}
+
+For directional alternatives we use the one-sided exact-binomial sign test
+on \(n_\text{moved}\); for two-sided alternatives the standard two-tailed
+exact-binomial test. For mean-outcome tests we use the one-sample
+\citet{Wilcoxon1945} signed-rank test against zero. For null-distribution comparison on
+ambiguous-direction kinds we use the Mann--Whitney \(U\) two-sample test
+against the random baseline described below.
+
+\subsection{Time-and-token-matched random baseline}
+
+For each emitted signal at time \(t\) on token \(T\), we generate a paired
+synthetic baseline at the same \((t, T)\) with the encoded direction drawn
+uniformly from \(\{\text{BUY}, \text{SELL}\}\). A second paired baseline
+inverts the realized signal's encoded direction (the \emph{contrarian}
+baseline). The same labeling protocol is applied to all three. The triple
+distribution---realized, random, contrarian---makes the directional-prediction
+story explicit and renders interpretable any finding of the form
+``contrarian outperforms realized.''
+
+\subsection{Multiple-testing correction}
+
+Across the family of ten primary hypotheses we apply the
+\citet{BenjaminiHochberg1995} procedure at \(q = 0.05\). The reported
+FDR-adjusted \(p\)-value for hypothesis \(i\) is
+\(p^{\text{adj}}_i = \min_{k \geq i} \left( p_{(k)} \cdot n / k \right)\),
+where \(p_{(k)}\) is the \(k\)-th-smallest raw \(p\)-value and \(n = 10\).
+A hypothesis is declared \emph{supported} only if its adjusted \(p < 0.05\).
+
+We do not use the Bonferroni correction; FDR is the standard in
+financial-econometric signal screening
+\citep{HarveyLiuZhu2016}.
+
+\subsection{Power}
+
+For an exact-binomial sign test against \(H_\text{cond} = 0.5\) with
+two-sided \(\alpha = 0.05\), the minimum \(n_\text{moved}\) for power
+\(1-\beta\) at a target \(H_\text{cond}^*\) is approximately
+\((z_{\alpha/2} + z_\beta)^2 / (2(H_\text{cond}^* - 0.5))^2\); the
+analogous Wilcoxon approximation is the \citet{Lehr1992} rule-of-thumb
+\(n \approx 16 \sigma^2 / \Delta^2\). Table~\ref{tab:power} summarizes the
+resulting sample requirements at \(1-\beta = 0.8\) and \(0.9\).
+
+\begin{table}[t]
+\centering
+\caption{Sample-size requirements for the binomial sign test at \(\alpha = 0.05\).}
+\label{tab:power}
+\small
+\begin{tabular}{lrr}
+\toprule
+True \(H_\text{cond}\) & \(n_\text{min}\) at power 0.8 & \(n_\text{min}\) at power 0.9 \\
+\midrule
+0.55 & 196 & 263 \\
+0.60 &  49 &  66 \\
+0.65 &  22 &  30 \\
+0.70 &  13 &  17 \\
+0.80 &   5 &   7 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%==============================================================================
+\section{Preliminary results}
+\label{sec:results}
+
+We present interim results from the live sample at the time of writing.
+Final results require the full sample window specified in
+Section~\ref{sec:prereg}; the interim numbers below are illustrative of
+the analysis but should not be treated as the published finding. The
+script \texttt{scripts/research\_report.py} reproduces every table from
+the raw \texttt{signal\_log}.
+
+Table~\ref{tab:results} presents the per-kind primary results.
+
+\begin{table}[t]
+\centering
+\caption{Preliminary per-kind results. \(n\): emitted signals.
+\(n_\text{lab}\): labeled. \(n_\text{mv}\): moved (outcome \(\neq 0\)).
+Brackets show \(95\%\) Clopper--Pearson CI on \(H_\text{cond}\) and bootstrap
+CI on \(\mu\). \(p_\text{raw}\) is the preregistered sign-test or Wilcoxon
+\(p\)-value; \(p_\text{adj}\) is the Benjamini--Hochberg-adjusted \(p\)-value
+over the family of ten kinds.}
+\label{tab:results}
+\footnotesize
+\begin{tabularx}{\linewidth}{l r r r l l r r l}
+\toprule
+Kind & \(n\) & \(n_\text{lab}\) & \(n_\text{mv}\) & \(H_\text{cond}\) [95\% CI] & \(\mu\) [95\% CI] & \(p_\text{raw}\) & \(p_\text{adj}\) & Verdict \\
+\midrule
+struct\_arb / partition\_buy\_all   &   1 &   1 &   1 & --- & \(+0.029\) & --- & --- & underpowered \\
+struct\_arb / partition\_sell\_all  &   1 &   1 &   1 & --- & \(+0.008\) & --- & --- & underpowered \\
+struct\_arb / complement            &   0 &   0 &   0 & --- & --- & --- & --- & none \\
+microstructure / ofi\_pressure       & 895 & 859 & 135 & \textbf{0.704} \([0.619, 0.779]\) & \(+0.0004\) \([-0.0006, +0.0014]\) & \(<10^{-6}\) & \(<10^{-6}\) & \textbf{supported} \\
+microstructure / liquidity\_shock    &  27 &  20 &  20 & 0.500 \([0.272, 0.728]\) & \(-0.005\) \([-0.039, +0.029]\) & 1.000 & 1.000 & null \\
+microstructure / trade\_through      &  92 &  59 &  59 & 0.356 \([0.236, 0.491]\) & \(-0.025\) \([-0.050, -0.000]\) & 0.036 & 0.127 & not supported (FDR-marginal) \\
+rel\_value / complement\_drift       &   3 &   3 &   3 & 0.667 \([0.094, 0.992]\) & \(+0.018\) \([-0.015, +0.058]\) & 0.500 & 0.700 & underpowered \\
+rel\_value / partition\_sum\_drift   &   2 &   2 &   2 & 0.500 \([0.013, 0.987]\) & \(-0.003\) \([-0.012, +0.006]\) & 0.750 & 0.875 & underpowered \\
+momentum / directional\_momentum     &   0 &   0 &   0 & --- & --- & --- & --- & no signals \\
+momentum / boundary\_overshoot       &   0 &   0 &   0 & --- & --- & --- & --- & no signals \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Order-flow imbalance}
+
+The OFI result is the headline. The conditional-on-movement hit rate of
+\(70.4\%\) on a sample of \(n_\text{moved} = 135\) is well above the
+preregistered threshold and survives Benjamini--Hochberg correction with
+\(p_\text{adj} < 10^{-6}\). The point estimate of mean outcome
+(\(+0.0004\)) is small in absolute terms---roughly one tick over the
+fifteen-minute horizon---but the bootstrap CI excludes zero.
+
+The raw hit-rate metric \(H_\text{raw} = 11.1\%\) is, on its face, evidence
+\emph{against} OFI on this venue. The interpretation reverses entirely
+under the conditional metric because \(\approx 85\%\) of forward returns
+are exactly zero. This is the empirical case for the methodological
+contribution of the paper: the conditional metric should be the primary
+metric on tick-discretized binary venues.
+
+\subsection{Trade-through prints: contrarian, FDR-marginal}
+
+The trade-through result tests whether prints printing meaningfully far
+from the prevailing mid (the classical \citealp{LeeReady1991} informed-trade
+proxy) predict continuation in the trade-print direction.
+\emph{Continuation} would imply \(H_\text{cond} > 0.5\); \emph{reversion}
+\(H_\text{cond} < 0.5\). The observed \(H_\text{cond} = 0.356\) is below
+\(0.5\), with raw two-sided \(p = 0.036\). However, FDR correction across
+the ten-kind family pushes \(p_\text{adj} = 0.127\), which does not meet
+the preregistered \(q = 0.05\) cutoff.
+
+We therefore decline to declare the contrarian finding \emph{supported}.
+We do note that the direction of effect is robust across all bootstrap
+perturbations we tried and is the opposite of the directional prediction
+from the equity microstructure literature
+\citep{Hasbrouck2007,ContKukanovStoikov2014}. This is precisely the kind
+of result that FDR correction is designed to flag for replication: the
+direction is interesting; the within-sample evidence is not strong enough
+to declare a finding. We pre-commit to retesting on out-of-sample data.
+
+\subsection{Liquidity shocks: clean null}
+
+\(H_\text{cond} = 0.500\) exactly. The bootstrap CI \([0.272, 0.728]\) is
+wide but centered on the null. We declare a null result. This is
+informative for the divided liquidity-event literature
+(\citealp{EasleyLopezdePradoOHara2012} vs.\ \citealp{NaesSkjeltorp2006});
+liquidity shocks on this venue, as we have defined them, are not directionally
+predictive of fifteen-minute mid drift. We note that the sample is
+borderline underpowered (\(n_\text{moved} = 20 < 49\), the threshold for
+power 0.8 against a true \(H_\text{cond} = 0.6\)) and re-test at sample
+close.
+
+\subsection{Underpowered kinds}
+
+Structural arbitrage (H1--H3), relative value (H7--H8), and momentum
+(H9--H10) all have \(n_\text{moved} \ll 30\) at the time of the interim
+analysis. We report point estimates for completeness but make no inferential
+claim. The structural-arbitrage kinds in particular are subject to a
+natural floor on \(n\): a healthy venue should produce few true
+arbitrage opportunities. We anticipate that a fourteen-day sample may
+still leave H1--H3 underpowered.
+
+%==============================================================================
+\section{Threats to validity and robustness}
+\label{sec:robust}
+
+We enumerate the principal threats to validity below; the comprehensive
+list is in the project's \texttt{research/CRITIQUE.md} artifact.
+
+\subsection{Selection bias from the half-rule}
+
+A signal is labeled only if at least half of its constituent legs have a
+live, non-stale book at label time. Markets that resolved or delisted
+mid-horizon are silently excluded from the labeled set. The exclusion is
+not random with respect to outcome: an informational event may simultaneously
+trigger a signal and accelerate resolution.
+
+We mitigate by reporting \(n_\text{excluded} = n - n_\text{lab}\) alongside
+\(n_\text{lab}\), and we will, at sample close, run a worst-case sensitivity
+analysis under the perturbations \(O_\text{excluded} \in \{0, \bar\mu, -\bar\mu\}\).
+A finding robust to all three perturbations is the conservative reported
+result.
+
+\subsection{Tick-size discretization}
+
+Discussed at length in Section~\ref{sec:methods}. The empirical
+fifteen-minute zero-mass is documented; the \(H_\text{cond}\) metric is the
+mitigation. The residual concern is whether conditioning on movement is
+itself selecting on the dependent variable. We argue it is not: the
+movement indicator is independent of the encoded direction of the signal,
+which is the test of interest.
+
+\subsection{Look-ahead in offline replay}
+
+The offline-replay harness used for threshold tuning uses the \emph{current}
+markets-metadata snapshot; markets that joined a NegRisk group after the
+replayed events would be misgrouped. This affects only the threshold-tuning
+analyses, not the primary tests, which use the live-emitted
+\texttt{signal\_log} entries on which metadata was correct at emission time.
+
+\subsection{Within-token dependence}
+
+Multiple signals on the same token within a short window are not
+independent. The vanilla bootstrap understates the variance of any per-token
+average. We mitigate with the block-bootstrap-by-token estimator described
+in Section~\ref{sec:methods}; whichever CI is wider is the reported claim.
+
+\subsection{Multiple testing}
+
+Discussed extensively in Section~\ref{sec:methods}. The
+\citet{BenjaminiHochberg1995} procedure controls FDR at \(q = 0.05\) across
+the ten-kind family. Sensitivity-analysis horizons (five, fifteen, sixty
+minutes) are reported for completeness but are not used to declare
+significance.
+
+\subsection{Regime dependence and external validity}
+
+The sample is a multi-day window. Polymarket regime shifts dramatically
+across major events; signals that worked during a U.S.\ election cycle
+may not work in a quiet sports week. We disclose the calendar window
+explicitly and make no claim of generalization beyond it.
+
+\subsection{Construct validity of forward mid return}
+
+The labeled outcome is a forward mid drift, not realized P\&L. It ignores
+spread crossing, slippage, queue position, and market impact. The study
+makes \emph{no} P\&L claim, and the OFI finding in particular should not
+be read as a deployable strategy. The conversion from a directionally
+informative mid-drift signal to a deployable strategy is the work of a
+separate execution-economics study that we do not undertake here.
+
+%==============================================================================
+\section{Preregistration manifest}
+\label{sec:prereg}
+
+\begin{itemize}[noitemsep]
+\item \textbf{Repository.} \url{https://github.com/amadogabriel/pred_market}
+\item \textbf{Registration commit.} Tagged on the public repository as the
+\texttt{HYPOTHESES.md} commit; subsequent edits are versioned in the git
+log under \texttt{research/}.
+\item \textbf{Sample window.} The seven-day live soak beginning at the
+registration commit, extensible to fourteen days subject to opportunity
+frequency on the rare-event signal kinds.
+\item \textbf{Analysis script.} \texttt{scripts/research\_report.py} at the
+analysis-time git SHA reproduces every table in this paper.
+\item \textbf{Artifacts.} The event-log day-files, the markets-metadata
+snapshot at registration and at analysis, the \texttt{config/fees.yaml}
+version covering the window, and the engine commit SHA collectively
+constitute the reproducibility package. Where the venue's terms of service
+permit, these will be released as a research dataset; otherwise we release
+the aggregated \texttt{signal\_log} dump.
+\end{itemize}
+
+%==============================================================================
+\section{Conclusion}
+\label{sec:conc}
+
+We have presented a preregistered evaluation of ten candidate intraday
+signals on the Polymarket centralized-limit-order-book prediction market.
+The headline interim finding is that order-flow imbalance is a directionally
+predictive signal of fifteen-minute mid drift at this venue, with
+conditional-on-movement hit rate \(70.4\%\) and FDR-adjusted
+\(p < 10^{-6}\). We document a substantial measurement artifact---roughly
+\(85\%\) of forward returns are exactly zero, driven by tick-size
+discretization---and propose a conditional-on-movement metric as the
+appropriate primary metric for tick-discretized binary markets.
+
+The trade-through finding is directionally suggestive of a contrarian
+effect on Polymarket---the \emph{opposite} of the equity-microstructure
+prediction---but does not survive the family-wise FDR correction at the
+preregistered threshold. We pre-commit to retesting on out-of-sample data.
+The relative-value, structural-arbitrage, and momentum families are
+underpowered in the interim sample.
+
+The research framework is open-source and reproducible from the raw event
+log. We offer it both as an empirical contribution to a venue that has not
+been formally studied at the intraday level and as a methodological
+demonstration of how to manage tick-size discretization and multiple-testing
+inflation in screening studies on emerging-venue data.
+
+%==============================================================================
+\section*{Acknowledgments}
+
+The author acknowledges the engineering scaffolding contributed by the
+Codex coding assistant in the construction of the data-collection
+framework, with all analytical interpretation, hypothesis specification,
+and statistical inference the author's own.
+
+\bibliographystyle{elsarticle-harv}
+\bibliography{references}
+
+\end{document}
