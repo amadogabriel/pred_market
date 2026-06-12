@@ -45,6 +45,37 @@ def _event_log_status(settings) -> dict:
 
 def _paper_portfolio(conn, settings) -> dict:
     """Replay executable signal rows into a small read-only paper portfolio."""
+    market_meta: dict[str, dict] = {}
+
+    def market_info(market_id: str | None) -> dict:
+        if not market_id:
+            return {"slug": "", "question": "", "url": ""}
+        if market_id not in market_meta:
+            row = conn.execute(
+                "SELECT slug, question FROM markets WHERE market_id=?", (market_id,)).fetchone()
+            slug = str(row["slug"] or "") if row else ""
+            market_meta[market_id] = {
+                "slug": slug,
+                "question": str(row["question"] or "") if row else "",
+                "url": f"https://polymarket.com/event/{slug}" if slug else "",
+            }
+        return market_meta[market_id]
+
+    def linked_legs(legs: list[dict]) -> list[dict]:
+        out = []
+        for leg in legs:
+            market_id = leg.get("market_id")
+            meta = market_info(market_id)
+            out.append({
+                "token_id": str(leg.get("token_id", "")),
+                "market_id": str(market_id or ""),
+                "side": str(leg.get("side", "")).upper(),
+                "url": meta["url"],
+                "slug": meta["slug"],
+                "question": meta["question"],
+            })
+        return out
+
     bankroll = float(settings.paper_portfolio_usd)
     allowed = set(settings.execution_strategies)
     cash = bankroll
@@ -82,7 +113,7 @@ def _paper_portfolio(conn, settings) -> dict:
     def add_decision(row, *, status: str, action: str, reason: str,
                      sets: float = 0.0, notional: float = 0.0,
                      cost_per_set: float = 0.0, paper_pnl: float = 0.0,
-                     sim_pnl: float = 0.0) -> None:
+                     sim_pnl: float = 0.0, legs: list[dict] | None = None) -> None:
         decisions.append({
             "signal_id": row["signal_id"],
             "strategy": row["strategy"],
@@ -96,6 +127,7 @@ def _paper_portfolio(conn, settings) -> dict:
             "net_edge": round(float(row["net_edge"] or 0.0), 4),
             "paper_pnl": round(paper_pnl, 4),
             "sim_pnl": round(sim_pnl, 4),
+            "tokens": linked_legs(legs or []),
             "ts": row["ts"],
         })
 
@@ -123,12 +155,13 @@ def _paper_portfolio(conn, settings) -> dict:
         if sides == {"BUY"}:
             cost_per_set = sum(float(leg["price"]) for leg in legs)
             if cost_per_set <= 0:
-                add_decision(row, status="skipped", action="buy", reason="bad quoted cost")
+                add_decision(row, status="skipped", action="buy", reason="bad quoted cost",
+                             legs=legs)
                 continue
             sets = min(exec_sets, cash / cost_per_set if cash > 0 else 0.0)
             if sets <= 1e-9:
                 add_decision(row, status="skipped", action="buy", reason="no cash left",
-                             cost_per_set=cost_per_set)
+                             cost_per_set=cost_per_set, legs=legs)
                 continue
             notional = sets * cost_per_set
             cash -= notional
@@ -148,7 +181,7 @@ def _paper_portfolio(conn, settings) -> dict:
             sim_pnl = float(outcome) * sets if outcome is not None else 0.0
             add_decision(row, status="picked", action="buy", reason=reason,
                          sets=sets, notional=notional, cost_per_set=cost_per_set,
-                         sim_pnl=sim_pnl)
+                         sim_pnl=sim_pnl, legs=legs)
             picked[key]["selected"] += 1
             picked[key]["notional"] += notional
             picked[key]["sim_pnl"] += sim_pnl
@@ -163,7 +196,7 @@ def _paper_portfolio(conn, settings) -> dict:
             if sets <= 1e-9:
                 add_decision(row, status="skipped", action="sell",
                              reason="no paper inventory to close",
-                             cost_per_set=proceeds_per_set)
+                             cost_per_set=proceeds_per_set, legs=legs)
                 continue
             notional = sets * proceeds_per_set
             paper_pnl = 0.0
@@ -183,7 +216,7 @@ def _paper_portfolio(conn, settings) -> dict:
             sim_pnl = float(outcome) * sets if outcome is not None else 0.0
             add_decision(row, status="picked", action="sell", reason=reason,
                          sets=sets, notional=notional, cost_per_set=proceeds_per_set,
-                         paper_pnl=paper_pnl, sim_pnl=sim_pnl)
+                         paper_pnl=paper_pnl, sim_pnl=sim_pnl, legs=legs)
             picked[key]["selected"] += 1
             picked[key]["notional"] += notional
             picked[key]["paper_pnl"] += paper_pnl
@@ -191,7 +224,7 @@ def _paper_portfolio(conn, settings) -> dict:
 
         else:
             add_decision(row, status="skipped", action="skip",
-                         reason="mixed or unsupported leg sides")
+                         reason="mixed or unsupported leg sides", legs=legs)
 
     for key, values in picked.items():
         if key in strategy_rows:
@@ -207,11 +240,15 @@ def _paper_portfolio(conn, settings) -> dict:
     for pos in positions.values():
         if pos["size"] <= 1e-9:
             continue
+        meta = market_info(pos["market_id"])
         cost = pos["size"] * pos["avg_price"]
         open_cost += cost
         open_positions.append({
             "token_id": pos["token_id"],
             "market_id": pos["market_id"],
+            "url": meta["url"],
+            "slug": meta["slug"],
+            "question": meta["question"],
             "size": round(pos["size"], 4),
             "avg_price": round(pos["avg_price"], 4),
             "cost": round(cost, 4),
@@ -412,6 +449,8 @@ INDEX_HTML = """<!DOCTYPE html>
   .bar > i { display:block; height:100%; background:var(--accent); }
   .cat-row { display:flex; justify-content:space-between; font-size:12px; padding:2px 0; }
   .tag { font-size:10px; padding:1px 6px; border-radius:4px; background:var(--panel2); color:var(--muted); }
+  a.ext { color:var(--accent); text-decoration:none; }
+  a.ext:hover { text-decoration:underline; }
   .err { color:var(--red); }
 </style>
 </head>
@@ -473,7 +512,18 @@ const fmtMoney = v => v == null ? "n/a" : (Number(v) < 0 ? "-$" : "$") +
   Math.abs(Number(v)).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const fmtAge = s => s == null ? "—" : (s < 90 ? s.toFixed(0)+"s" : (s/60).toFixed(1)+"m");
 const fmtUsd = v => v == null ? "—" : "$" + Math.round(v).toLocaleString();
-const esc = s => String(s ?? "").replace(/[&<>]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+const esc = s => {
+  const span = document.createElement("span");
+  span.textContent = String(s ?? "");
+  return span.innerHTML;
+};
+const short = (s, n=18) => String(s ?? "").slice(0, n);
+const extLink = (url, label, title) => url
+  ? `<a class="ext" href="${esc(url)}" target="_blank" rel="noreferrer" title="${esc(title || url)}">${esc(label)}</a>`
+  : esc(label);
+const tokenLinks = tokens => (tokens || []).map(t =>
+  extLink(t.url, `${t.side}:${short(t.token_id, 8)}`, `${t.question || t.slug || "Polymarket market"}\n${t.token_id}`)
+).join(" ");
 
 function card(label, value, sub) {
   return `<div class="card"><div class="label">${label}</div>
@@ -548,12 +598,12 @@ async function refresh() {
     : '<div class="empty">no strategy rows yet</div>';
 
   $("betsizing").innerHTML = pp.decisions.length ?
-    `<table><tr><th>signal</th><th>strategy</th><th>kind</th><th>action</th><th>status</th>
+    `<table><tr><th>signal</th><th>strategy</th><th>kind</th><th>tokens</th><th>action</th><th>status</th>
        <th>reason</th><th class="num">$/set</th><th class="num">sets</th>
        <th class="num">notional</th><th class="num">edge</th><th class="num">paper PnL</th>
        <th class="num">sim PnL</th></tr>` +
     pp.decisions.map(d => `<tr><td>${d.signal_id}</td><td><span class="tag">${esc(d.strategy)}</span></td>
-      <td>${esc(d.kind)}</td><td>${esc(d.action)}</td><td>${esc(d.status)}</td>
+      <td>${esc(d.kind)}</td><td>${tokenLinks(d.tokens)}</td><td>${esc(d.action)}</td><td>${esc(d.status)}</td>
       <td>${esc(d.reason)}</td><td class="num">${fmtMoney(d.cost_per_set)}</td>
       <td class="num">${Number(d.sets).toFixed(2)}</td><td class="num">${fmtMoney(d.notional)}</td>
       <td class="num">${Number(d.net_edge).toFixed(4)}</td><td class="num">${fmtMoney(d.paper_pnl)}</td>
@@ -563,8 +613,8 @@ async function refresh() {
   $("paperpositions").innerHTML = pp.positions.length ?
     `<table><tr><th>token</th><th>market</th><th class="num">shares</th>
        <th class="num">avg price</th><th class="num">cost</th></tr>` +
-    pp.positions.map(p => `<tr><td>${esc((p.token_id||"").slice(0,18))}</td>
-      <td>${esc((p.market_id||"").slice(0,18))}</td>
+    pp.positions.map(p => `<tr><td>${extLink(p.url, short(p.token_id, 18), p.question || p.slug || p.token_id)}</td>
+      <td>${extLink(p.url, short(p.market_id, 18), p.question || p.slug || p.market_id)}</td>
       <td class="num">${Number(p.size).toFixed(2)}</td>
       <td class="num">${Number(p.avg_price).toFixed(4)}</td>
       <td class="num">${fmtMoney(p.cost)}</td></tr>`).join("") + `</table>`

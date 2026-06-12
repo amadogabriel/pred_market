@@ -35,8 +35,23 @@ def _signal(conn, *, kind: str, legs: list[dict], exec_sets: float,
     return signal_id
 
 
+def _market(conn, market_id: str, slug: str, question: str, token: str) -> None:
+    db.upsert_market(conn, {
+        "market_id": market_id,
+        "venue": "polymarket",
+        "question": question,
+        "slug": slug,
+        "category": "sports",
+        "active": 1,
+        "closed": 0,
+        "token_yes": token,
+    })
+
+
 def test_paper_portfolio_replay_sizes_against_total_bankroll(tmp_path):
     conn = db.connect(tmp_path / "state.db")
+    _market(conn, "MA", "market-a", "Market A", "A")
+    _market(conn, "MB", "market-b", "Market B", "B")
     _signal(
         conn,
         kind="partition_buy_all",
@@ -73,6 +88,8 @@ def test_paper_portfolio_replay_sizes_against_total_bankroll(tmp_path):
     assert portfolio["total_pnl_at_cost"] == pytest.approx(3.0)
     assert portfolio["realized_pnl"] == pytest.approx(3.0)
     assert portfolio["decisions"][0]["reason"] == "cash cap"
+    assert portfolio["decisions"][0]["tokens"][0]["url"] == "https://polymarket.com/event/market-a"
+    assert portfolio["positions"][0]["url"] == "https://polymarket.com/event/market-a"
 
 
 def test_paper_portfolio_respects_strategy_allowlist(tmp_path):
