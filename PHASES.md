@@ -99,17 +99,28 @@ Still required before live mode:
 
 ## Phase 4: Research and Backtesting
 
-Status: replay/reporting substrate implemented.
+Status: replay/reporting substrate implemented + preregistered MS-research
+project framed in `research/` tree.
 
 - `pm.backtest.replay` iterates and summarizes event logs
+- `pm.backtest.signal_replay` event-time replay of S2/S3/S4 scanners
+- `pm.research.stats` stdlib-only stats primitives (bootstrap, sign test,
+  Wilcoxon, Mann-Whitney, Benjamini-Hochberg FDR)
+- `pm.research.baseline` time-and-token-matched random/contrarian baseline
 - `scripts/replay_events.py` reports replay coverage
+- `scripts/replay_signals.py` offline threshold tuning
+- `scripts/research_report.py` runs the preregistered analysis
 - `scripts/daily_report.py` prints operational state
+- `research/` tree — full preregistered project (literature, hypotheses,
+  methodology, statistics, critique, preliminary results)
 
 Still required:
 
 - Deterministic order-book reconstruction from event logs
 - Strategy replay with latency/slippage assumptions
 - Meta-label training from `signal_log`
+- Final analysis at sample-period close (14-day soak)
+- Out-of-sample confirmation of any positive findings
 
 ## Phase 5: Production Operations
 

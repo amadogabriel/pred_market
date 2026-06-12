@@ -169,6 +169,29 @@ Every NegRisk group must be manually verified before any execution is enabled.
 
 ---
 
+## Research framing
+
+The signal scanners + labeler + replay harness are not just engineering —
+they are the laboratory for a preregistered empirical study. See the
+`research/` tree:
+
+- `research/README.md` — abstract, research questions, contribution claims
+- `research/LITERATURE.md` — situates the work vs Wolfers/Zitzewitz,
+  Cont/Kukanov, Easley/de Prado, and the gap on Polymarket specifically
+- `research/HYPOTHESES.md` — preregistered nulls, alternatives, decision
+  rules for each of the 10 signal kinds
+- `research/METHODOLOGY.md` — data collection, half-rule labeling,
+  horizon, reproducibility protocol
+- `research/STATISTICS.md` — bootstrap CIs, sign / Wilcoxon / Mann-Whitney,
+  Benjamini-Hochberg FDR, power analysis
+- `research/CRITIQUE.md` — explicit threats to validity (selection bias,
+  tick-size discretisation, look-ahead, multi-leg dilution, etc.)
+- `research/RESULTS_PRELIMINARY.md` — interim findings (OFI is
+  FDR-significant; trade_through is contrarian but FDR-marginal)
+
+Run the analysis: `python scripts/research_report.py`. The stats module
+(`pm/research/stats.py`) is pure-stdlib and unit-tested.
+
 ## Research signals (S2 microstructure, S3 relative value, S4 momentum) + labeler
 
 Research signals are observational by contract: `exec_sets=0` (can never form
