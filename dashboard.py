@@ -1,849 +1,356 @@
-"""pm-system dashboard — read-only web UI.
+"""Read-only status dashboard — plain-language, honest about what works.
 
-A small aiohttp server that reads the operational state DB and serves a
-single auto-refreshing page plus a JSON API (`/api/state`). It never writes:
-purely an observability surface over the same `state.db` the engine maintains
-(SQLite WAL allows concurrent readers). Run it as a third process alongside
-the engine and monitor.
+Serves one page at PM_DASH_HOST:PM_DASH_PORT (default 127.0.0.1:8787). It is a
+window onto the engine's SQLite state, nothing more — it never places orders,
+never writes, and is safe to leave open.
 
-    python dashboard.py        # then open http://127.0.0.1:8787
+Design intent: a non-finance reader should understand, in thirty seconds,
+(1) whether the system is alive, (2) what each strategy is trying to do in
+plain words, and (3) which strategies actually work versus which are dead
+ends kept only as research. We deliberately do NOT show the things that
+mislead: an AI model that doesn't beat a coin flip, or a "paper profit"
+number computed from signals that have no edge.
 """
 from __future__ import annotations
 
-import json
-import logging
 import time
-from collections import defaultdict
 from pathlib import Path
-from urllib.parse import quote_plus
 
 from aiohttp import web
 
 from config.settings import Settings
 from pm.core import db
 
-log = logging.getLogger(__name__)
-
-STALE_AGE = 120.0  # seconds; matches monitor's component-staleness threshold
-PAPER_DECISION_LIMIT = 20
+STALE_AGE = 120.0  # a component quiet longer than this is flagged "stale"
 
 
-def _event_log_status(settings) -> dict:
-    """Size + freshness of today's event-log file (cheap; no line count)."""
-    from datetime import datetime, timezone
-    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    path = Path(settings.events_dir) / day / "events.jsonl"
-    if not path.exists():
-        return {"exists": False, "day": day, "size_mb": 0.0, "age_s": None}
-    st = path.stat()
+# Plain-language description + honest standing for each strategy. The numbers
+# are filled in live; the words are fixed and reviewed.
+STRATEGY_INFO = {
+    "struct_arb": {
+        "name": "Risk-free arbitrage",
+        "plain": "Buys every outcome of an event when together they cost less "
+                 "than the $1 they're guaranteed to pay out. A locked-in profit "
+                 "when it appears — but it appears rarely.",
+        "tier": "real",
+    },
+    "whale_follow": {
+        "name": "Copy proven wallets",
+        "plain": "Watches the blockchain for big bettors, scores them as their "
+                 "bets settle, and flags when a wallet with a winning track "
+                 "record places a new bet.",
+        "tier": "testing",
+    },
+    "news": {
+        "name": "News reaction",
+        "plain": "Reads live news headlines and flags a market when a headline "
+                 "should move its price before the market catches up.",
+        "tier": "live",
+    },
+    "calibration": {
+        "name": "Model vs. market",
+        "plain": "Compares the market price to an independent probability "
+                 "estimate and flags large disagreements.",
+        "tier": "needs_setup",
+    },
+    "microstructure": {
+        "name": "Order-book patterns",
+        "plain": "Looked for very short-term price patterns in the order book "
+                 "(buying pressure, big trades, liquidity gaps).",
+        "tier": "dead",
+    },
+    "momentum": {
+        "name": "Price momentum",
+        "plain": "Looked for prices that keep drifting one direction, or bounce "
+                 "off the extremes near $0 and $1.",
+        "tier": "dead",
+    },
+    "rel_value": {
+        "name": "Price inconsistencies",
+        "plain": "Looked for related contracts whose prices stopped adding up "
+                 "the way they should.",
+        "tier": "dead",
+    },
+}
+
+# Plain-language label + colour for each tier.
+TIER = {
+    "real":        {"label": "Works — but rare",        "color": "good"},
+    "testing":     {"label": "Collecting data",         "color": "info"},
+    "live":        {"label": "Running",                 "color": "info"},
+    "needs_setup": {"label": "Not set up",              "color": "muted"},
+    "dead":        {"label": "No edge — research only",  "color": "muted"},
+}
+
+STRATEGY_ORDER = ["whale_follow", "struct_arb", "news", "calibration",
+                  "microstructure", "momentum", "rel_value"]
+
+
+def _scalar(conn, sql, *args):
+    try:
+        row = conn.execute(sql, args).fetchone()
+    except Exception:  # noqa: BLE001 — table may not exist yet
+        return 0
+    return list(row)[0] if row and row[0] is not None else 0
+
+
+def _whale_stats(conn) -> dict:
     return {
-        "exists": True,
-        "day": day,
-        "size_mb": round(st.st_size / 1_048_576, 3),
-        "age_s": round(time.time() - st.st_mtime, 1),
+        "positions": _scalar(conn, "SELECT COUNT(*) FROM whale_positions"),
+        "wallets": _scalar(conn, "SELECT COUNT(*) FROM whale_wallets"),
+        "tracked": _scalar(conn, "SELECT COUNT(*) FROM whale_wallets WHERE tracked=1"),
+        "resolved": _scalar(conn, "SELECT COUNT(*) FROM whale_positions WHERE outcome IS NOT NULL"),
     }
 
 
-def _paper_portfolio(conn, settings) -> dict:
-    """Replay executable signal rows into a small read-only paper portfolio."""
-    market_meta: dict[str, dict] = {}
+def _strategy_rows(conn) -> dict:
+    rows = {}
+    for r in conn.execute(
+            "SELECT strategy, COUNT(*) n, "
+            "SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END) labeled, "
+            "AVG(outcome) avg_outcome, "
+            "AVG(CASE WHEN outcome>0 THEN 1.0 WHEN outcome IS NOT NULL THEN 0.0 END) hit "
+            "FROM signal_log GROUP BY strategy"):
+        rows[r["strategy"]] = dict(r)
+    return rows
 
-    def market_info(market_id: str | None) -> dict:
-        if not market_id:
-            return {
-                "slug": "", "question": "", "url": "", "closed": False,
-                "token_yes": "", "token_no": "", "outcome_prices": [],
-                "resolution_status": "", "accepting_orders": None,
-            }
-        if market_id not in market_meta:
-            row = conn.execute(
-                "SELECT slug, question, closed, accepting_orders, outcome_prices_json, "
-                "resolution_status, token_yes, token_no FROM markets WHERE market_id=?",
-                (market_id,)).fetchone()
-            slug = str(row["slug"] or "") if row else ""
-            question = str(row["question"] or "") if row else ""
-            outcome_prices = []
-            if row and row["outcome_prices_json"]:
-                try:
-                    outcome_prices = [float(v) for v in json.loads(row["outcome_prices_json"])]
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    outcome_prices = []
-            search_query = question or str(market_id)
-            market_meta[market_id] = {
-                "slug": slug,
-                "question": question,
-                "closed": bool(row["closed"]) if row else False,
-                "accepting_orders": (
-                    None if not row or row["accepting_orders"] is None
-                    else bool(row["accepting_orders"])
-                ),
-                "outcome_prices": outcome_prices,
-                "resolution_status": str(row["resolution_status"] or "") if row else "",
-                "token_yes": str(row["token_yes"] or "") if row else "",
-                "token_no": str(row["token_no"] or "") if row else "",
-                "url": (
-                    f"https://polymarket.com/market/{slug}" if slug
-                    else f"https://polymarket.com/search?query={quote_plus(search_query)}"
-                ),
-            }
-        return market_meta[market_id]
 
-    def position_mark_price(meta: dict, token_id: str) -> float | None:
-        prices = meta.get("outcome_prices") or []
-        if len(prices) < 2:
-            return None
-        if token_id == meta.get("token_yes"):
-            return float(prices[0])
-        if token_id == meta.get("token_no"):
-            return float(prices[1])
-        return None
-
-    def linked_legs(legs: list[dict]) -> list[dict]:
-        out = []
-        for leg in legs:
-            market_id = leg.get("market_id")
-            meta = market_info(market_id)
-            out.append({
-                "token_id": str(leg.get("token_id", "")),
-                "market_id": str(market_id or ""),
-                "side": str(leg.get("side", "")).upper(),
-                "url": meta["url"],
-                "slug": meta["slug"],
-                "question": meta["question"],
-            })
-        return out
-
-    bankroll = float(settings.paper_portfolio_usd)
-    cash = bankroll
-    realized_pnl = 0.0
-    deployed_notional = 0.0
-    sold_notional = 0.0
-    positions: dict[str, dict] = {}
-    decisions: list[dict] = []
-    picked = defaultdict(lambda: {
-        "selected": 0, "notional": 0.0, "paper_pnl": 0.0, "sim_pnl": 0.0,
-    })
-
-    strategy_rows = {
-        (r["strategy"], r["kind"]): {
-            "strategy": r["strategy"],
-            "kind": r["kind"],
-            "signals": int(r["signals"]),
-            "executable": int(r["executable"]),
-            "selected": 0,
-            "notional": 0.0,
-            "paper_pnl": 0.0,
-            "sim_pnl": 0.0,
-            "status": (
-                "paper eligible" if int(r["executable"]) > 0 else "no executable size"
-            ),
-        }
-        for r in conn.execute(
-            "SELECT strategy, kind, COUNT(*) signals, "
-            "SUM(CASE WHEN exec_sets > 0 THEN 1 ELSE 0 END) executable "
-            "FROM signal_log GROUP BY strategy, kind ORDER BY strategy, kind")
-    }
-
-    def add_decision(row, *, status: str, action: str, reason: str,
-                     sets: float = 0.0, notional: float = 0.0,
-                     cost_per_set: float = 0.0, paper_pnl: float = 0.0,
-                     sim_pnl: float = 0.0, legs: list[dict] | None = None) -> None:
-        decisions.append({
-            "signal_id": row["signal_id"],
-            "strategy": row["strategy"],
-            "kind": row["kind"],
-            "action": action,
-            "status": status,
-            "reason": reason,
-            "sets": round(sets, 4),
-            "notional": round(notional, 4),
-            "cost_per_set": round(cost_per_set, 4),
-            "net_edge": round(float(row["net_edge"] or 0.0), 4),
-            "paper_pnl": round(paper_pnl, 4),
-            "sim_pnl": round(sim_pnl, 4),
-            "tokens": linked_legs(legs or []),
-            "ts": row["ts"],
-        })
-
-    rows = conn.execute(
-        "SELECT signal_id, strategy, kind, group_id, legs_json, net_edge, "
-        "exec_sets, outcome, pnl, ts FROM signal_log "
-        "WHERE exec_sets > 0 ORDER BY ts, signal_id").fetchall()
-
-    for row in rows:
-        key = (row["strategy"], row["kind"])
-        if float(row["net_edge"] or 0.0) <= 0:
-            add_decision(row, status="skipped", action="skip",
-                         reason="non-positive edge")
-            continue
-
-        legs = json.loads(row["legs_json"] or "[]")
-        sides = {str(leg.get("side", "")).upper() for leg in legs}
-        exec_sets = float(row["exec_sets"] or 0.0)
-        outcome = row["outcome"]
-
-        if sides == {"BUY"}:
-            cost_per_set = sum(float(leg["price"]) for leg in legs)
-            if cost_per_set <= 0:
-                add_decision(row, status="skipped", action="buy", reason="bad quoted cost",
-                             legs=legs)
-                continue
-            sets = min(exec_sets, cash / cost_per_set if cash > 0 else 0.0)
-            if sets <= 1e-9:
-                add_decision(row, status="skipped", action="buy", reason="no cash left",
-                             cost_per_set=cost_per_set, legs=legs)
-                continue
-            notional = sets * cost_per_set
-            cash -= notional
-            deployed_notional += notional
-            for leg in legs:
-                token = str(leg["token_id"])
-                price = float(leg["price"])
-                pos = positions.setdefault(token, {
-                    "token_id": token, "market_id": leg.get("market_id"),
-                    "size": 0.0, "avg_price": 0.0,
-                })
-                old_size = pos["size"]
-                new_size = old_size + sets
-                pos["avg_price"] = ((old_size * pos["avg_price"]) + (sets * price)) / new_size
-                pos["size"] = new_size
-            reason = "cash cap" if sets < exec_sets else "quoted depth"
-            sim_pnl = float(outcome) * sets if outcome is not None else 0.0
-            add_decision(row, status="picked", action="buy", reason=reason,
-                         sets=sets, notional=notional, cost_per_set=cost_per_set,
-                         sim_pnl=sim_pnl, legs=legs)
-            picked[key]["selected"] += 1
-            picked[key]["notional"] += notional
-            picked[key]["sim_pnl"] += sim_pnl
-
-        elif sides == {"SELL"}:
-            proceeds_per_set = sum(float(leg["price"]) for leg in legs)
-            available_sets = min(
-                (positions.get(str(leg["token_id"]), {}).get("size", 0.0) for leg in legs),
-                default=0.0,
-            )
-            sets = min(exec_sets, available_sets)
-            if sets <= 1e-9:
-                add_decision(row, status="skipped", action="sell",
-                             reason="no paper inventory to close",
-                             cost_per_set=proceeds_per_set, legs=legs)
-                continue
-            notional = sets * proceeds_per_set
-            paper_pnl = 0.0
-            for leg in legs:
-                token = str(leg["token_id"])
-                price = float(leg["price"])
-                pos = positions[token]
-                paper_pnl += sets * (price - pos["avg_price"])
-                pos["size"] -= sets
-                if pos["size"] <= 1e-9:
-                    pos["size"] = 0.0
-                    pos["avg_price"] = 0.0
-            cash += notional
-            sold_notional += notional
-            realized_pnl += paper_pnl
-            reason = "inventory cap" if sets < exec_sets else "quoted depth"
-            sim_pnl = float(outcome) * sets if outcome is not None else 0.0
-            add_decision(row, status="picked", action="sell", reason=reason,
-                         sets=sets, notional=notional, cost_per_set=proceeds_per_set,
-                         paper_pnl=paper_pnl, sim_pnl=sim_pnl, legs=legs)
-            picked[key]["selected"] += 1
-            picked[key]["notional"] += notional
-            picked[key]["paper_pnl"] += paper_pnl
-            picked[key]["sim_pnl"] += sim_pnl
-
-        else:
-            add_decision(row, status="skipped", action="skip",
-                         reason="mixed or unsupported leg sides", legs=legs)
-
-    for key, values in picked.items():
-        if key in strategy_rows:
-            strategy_rows[key].update({
-                "selected": values["selected"],
-                "notional": round(values["notional"], 4),
-                "paper_pnl": round(values["paper_pnl"], 4),
-                "sim_pnl": round(values["sim_pnl"], 4),
-            })
-
-    open_positions = []
-    open_cost = 0.0
-    open_value = 0.0
-    unrealized_pnl = 0.0
-    for pos in positions.values():
-        if pos["size"] <= 1e-9:
-            continue
-        meta = market_info(pos["market_id"])
-        cost = pos["size"] * pos["avg_price"]
-        mark_price = position_mark_price(meta, pos["token_id"])
-        value = pos["size"] * mark_price if mark_price is not None else cost
-        pnl = value - cost
-        open_cost += cost
-        open_value += value
-        unrealized_pnl += pnl
-        status = "resolved" if mark_price is not None else ("closed" if meta["closed"] else "open")
-        open_positions.append({
-            "token_id": pos["token_id"],
-            "market_id": pos["market_id"],
-            "url": meta["url"],
-            "slug": meta["slug"],
-            "question": meta["question"],
-            "status": status,
-            "resolution_status": meta["resolution_status"],
-            "size": round(pos["size"], 4),
-            "avg_price": round(pos["avg_price"], 4),
-            "mark_price": None if mark_price is None else round(mark_price, 4),
-            "cost": round(cost, 4),
-            "value": round(value, 4),
-            "pnl": round(pnl, 4),
-        })
-
-    equity_at_cost = cash + open_cost
-    equity = cash + open_value
-    return {
-        "bankroll": round(bankroll, 4),
-        "cash": round(cash, 4),
-        "open_cost": round(open_cost, 4),
-        "open_value": round(open_value, 4),
-        "equity_at_cost": round(equity_at_cost, 4),
-        "equity": round(equity, 4),
-        "unrealized_pnl": round(unrealized_pnl, 4),
-        "realized_pnl": round(realized_pnl, 4),
-        "total_pnl": round(equity - bankroll, 4),
-        "total_pnl_at_cost": round(equity_at_cost - bankroll, 4),
-        "deployed_notional": round(deployed_notional, 4),
-        "sold_notional": round(sold_notional, 4),
-        "selected_bets": sum(v["selected"] for v in picked.values()),
-        "strategy_scope": "all executable signals",
-        "decisions": decisions[-PAPER_DECISION_LIMIT:],
-        "strategy_selection": list(strategy_rows.values()),
-        "positions": open_positions[:PAPER_DECISION_LIMIT],
-        "note": (
-            "Open positions are carried at cost unless Gamma has final outcome prices. "
-            "Rows with exec=0 are observations without executable sizing, not a strategy filter."
-        ),
-    }
+def _status_line(strategy: str, srow: dict, whale: dict) -> str:
+    """One plain-English sentence of current standing per strategy."""
+    n = int(srow.get("n", 0) or 0)
+    if strategy == "whale_follow":
+        return (f"{whale['wallets']} wallets found, {whale['tracked']} have "
+                f"earned a track record so far; {whale['resolved']} bets scored.")
+    if strategy == "struct_arb":
+        if n == 0:
+            return "None seen yet — these are genuinely rare."
+        return f"{n} found since launch (each is a one-off opportunity)."
+    if strategy == "calibration":
+        return "Needs a probability data source — none connected yet."
+    if strategy == "news":
+        return "Running. Fires only when a headline clearly matches a market."
+    # dead-end research strategies
+    labeled = int(srow.get("labeled", 0) or 0)
+    if not labeled:
+        return f"{n} recorded — kept for research only."
+    avg = srow.get("avg_outcome") or 0.0
+    direction = "no better than chance after fees" if avg <= 0.001 else "below the cost to trade it"
+    return f"{n} recorded, {labeled} scored — {direction}."
 
 
 def query_state(conn, settings) -> dict:
     now = time.time()
 
-    # component heartbeats
     components = []
     for r in conn.execute("SELECT component, ts, detail FROM heartbeats ORDER BY component"):
         age = now - r["ts"]
-        components.append({
-            "component": r["component"],
-            "age_s": round(age, 1),
-            "stale": age > STALE_AGE,
-            "detail": r["detail"] or "",
-        })
+        components.append({"component": r["component"], "age_s": round(age, 1),
+                           "ok": age <= STALE_AGE, "detail": r["detail"] or ""})
 
-    # engine heartbeat file
     hb_path = settings.heartbeat_path
     if hb_path.exists():
         hb_age = round(now - hb_path.stat().st_mtime, 1)
-        engine_hb = {"exists": True, "age_s": hb_age, "stale": hb_age > settings.heartbeat_stale_after}
+        engine_ok = hb_age <= settings.heartbeat_stale_after
     else:
-        engine_hb = {"exists": False, "age_s": None, "stale": True}
+        hb_age, engine_ok = None, False
 
-    def scalar(sql, *args):
-        row = conn.execute(sql, args).fetchone()
-        return list(row)[0] if row else 0
+    whale = _whale_stats(conn)
+    srows = _strategy_rows(conn)
+
+    strategies = []
+    for strat in STRATEGY_ORDER:
+        info = STRATEGY_INFO[strat]
+        srow = srows.get(strat, {})
+        tier = info["tier"]
+        strategies.append({
+            "key": strat,
+            "name": info["name"],
+            "plain": info["plain"],
+            "tier": tier,
+            "tier_label": TIER[tier]["label"],
+            "tier_color": TIER[tier]["color"],
+            "signals": int(srow.get("n", 0) or 0),
+            "status": _status_line(strat, srow, whale),
+        })
 
     counts = {
-        "markets": scalar("SELECT COUNT(*) FROM markets"),
-        "neg_risk_groups": scalar(
-            "SELECT COUNT(*) FROM (SELECT neg_risk_id FROM markets "
-            "WHERE neg_risk_id IS NOT NULL GROUP BY neg_risk_id HAVING COUNT(*)>1)"),
-        "signals": scalar("SELECT COUNT(*) FROM signal_log"),
-        "execution_intents": scalar("SELECT COUNT(*) FROM execution_intents"),
-        "fills": scalar("SELECT COUNT(*) FROM execution_fills"),
-        "risk_events": scalar("SELECT COUNT(*) FROM risk_events"),
-        "positions": scalar("SELECT COUNT(*) FROM positions WHERE ABS(size)>0"),
-        "recon_rows": scalar("SELECT COUNT(*) FROM recon_log"),
-        "rules_versions": scalar("SELECT COUNT(*) FROM rules_text"),
+        "markets_active": _scalar(conn, "SELECT COUNT(*) FROM markets WHERE active=1 AND closed=0"),
+        "markets_total": _scalar(conn, "SELECT COUNT(*) FROM markets"),
+        "signals": _scalar(conn, "SELECT COUNT(*) FROM signal_log"),
+        "real_trades": _scalar(conn, "SELECT COUNT(*) FROM execution_fills"),
     }
-
-    # recon drift summary (last hour)
-    since = now - 3600
-    recon = {
-        "max_abs_diff": round(scalar(
-            "SELECT COALESCE(MAX(ABS(diff)),0) FROM recon_log WHERE diff IS NOT NULL"), 4),
-        "drift_count": scalar(
-            "SELECT COUNT(*) FROM recon_log WHERE ABS(COALESCE(diff,0))>0.02 AND ts>?", since),
-        "recent": scalar("SELECT COUNT(*) FROM recon_log WHERE ts>?", since),
-    }
-
-    earnings = {
-        "signal_ev": round(scalar(
-            "SELECT COALESCE(SUM(net_edge * exec_sets),0) FROM signal_log"), 4),
-        "labeled_sim_pnl": round(scalar(
-            "SELECT COALESCE(SUM(pnl),0) FROM signal_log WHERE pnl IS NOT NULL"), 4),
-        "paper_realized_pnl": round(scalar(
-            "SELECT COALESCE(SUM(realized_pnl),0) FROM positions"), 4),
-        "paper_open_cost": round(scalar(
-            "SELECT COALESCE(SUM(ABS(size) * avg_price),0) FROM positions WHERE ABS(size)>0"), 4),
-        "filled_notional": round(scalar(
-            "SELECT COALESCE(SUM(price * size),0) FROM execution_fills"), 4),
-    }
-    paper_portfolio = _paper_portfolio(conn, settings)
-
-    # category breakdown
-    categories = [
-        {"category": (r["category"] or "(none)"), "n": r["n"]}
-        for r in conn.execute(
-            "SELECT category, COUNT(*) n FROM markets GROUP BY category ORDER BY n DESC LIMIT 10")
-    ]
-
-    # recent signals
-    signals = [dict(r) for r in conn.execute(
-        "SELECT signal_id, strategy, kind, group_id, net_edge, exec_sets, outcome, ts "
-        "FROM signal_log ORDER BY ts DESC LIMIT 15")]
-
-    # signal performance by strategy/kind (labeler outcomes)
-    signal_summary = dict(conn.execute(
-        "SELECT COUNT(*) signals, "
-        "SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END) labeled, "
-        "AVG(outcome) avg_outcome, "
-        "AVG(CASE WHEN outcome > 0 THEN 1.0 WHEN outcome IS NOT NULL THEN 0.0 END) hit_rate, "
-        "COALESCE(SUM(net_edge * exec_sets),0) signal_ev, "
-        "COALESCE(SUM(CASE WHEN pnl IS NOT NULL THEN pnl ELSE 0 END),0) sim_pnl, "
-        "SUM(CASE WHEN exec_sets > 0 THEN 1 ELSE 0 END) executable "
-        "FROM signal_log").fetchone())
-    signal_by_strategy = [dict(r) for r in conn.execute(
-        "SELECT strategy, COUNT(*) signals, "
-        "SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END) labeled, "
-        "AVG(outcome) avg_outcome, "
-        "AVG(CASE WHEN outcome > 0 THEN 1.0 WHEN outcome IS NOT NULL THEN 0.0 END) hit_rate, "
-        "COALESCE(SUM(net_edge * exec_sets),0) signal_ev, "
-        "COALESCE(SUM(CASE WHEN pnl IS NOT NULL THEN pnl ELSE 0 END),0) sim_pnl, "
-        "SUM(CASE WHEN exec_sets > 0 THEN 1 ELSE 0 END) executable "
-        "FROM signal_log GROUP BY strategy ORDER BY strategy")]
-    signal_perf = [dict(r) for r in conn.execute(
-        "SELECT strategy, kind, COUNT(*) n, "
-        "SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END) labeled, "
-        "AVG(outcome) avg_outcome, "
-        "COALESCE(SUM(net_edge * exec_sets),0) signal_ev, "
-        "COALESCE(SUM(CASE WHEN pnl IS NOT NULL THEN pnl ELSE 0 END),0) sim_pnl, "
-        "AVG(CASE WHEN outcome > 0 THEN 1.0 WHEN outcome IS NOT NULL THEN 0.0 END) hit_rate "
-        "FROM signal_log GROUP BY strategy, kind ORDER BY strategy, kind")]
-
-    # recent execution decisions
-    execution = [dict(r) for r in conn.execute(
-        "SELECT intent_id, signal_id, kind, side, token_id, price, size, notional, "
-        "status, reason, updated_at FROM execution_intents ORDER BY updated_at DESC LIMIT 15")]
-
-    # top tracked markets by liquidity
-    top_markets = [dict(r) for r in conn.execute(
-        "SELECT question, category, liquidity, neg_risk FROM markets "
-        "WHERE active=1 AND closed=0 ORDER BY COALESCE(liquidity,0) DESC LIMIT 12")]
 
     return {
         "now": now,
-        "engine_heartbeat": engine_hb,
+        "engine": {"ok": engine_ok, "age_s": hb_age},
         "components": components,
+        "components_ok": sum(1 for c in components if c["ok"]),
+        "components_total": len(components),
         "counts": counts,
-        "recon": recon,
-        "earnings": earnings,
-        "paper_portfolio": paper_portfolio,
-        "categories": categories,
-        "signals": signals,
-        "signal_summary": signal_summary,
-        "signal_by_strategy": signal_by_strategy,
-        "signal_perf": signal_perf,
-        "execution": execution,
-        "top_markets": top_markets,
-        "event_log": _event_log_status(settings),
+        "whale": whale,
+        "strategies": strategies,
     }
 
 
 async def handle_api(request: web.Request) -> web.Response:
-    state = query_state(request.app["conn"], request.app["settings"])
-    return web.json_response(state)
+    settings = request.app["settings"]
+    conn = request.app["conn"]
+    return web.json_response(query_state(conn, settings))
 
 
-async def handle_index(request: web.Request) -> web.Response:
-    return web.Response(text=INDEX_HTML, content_type="text/html")
-
-
-INDEX_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>pm-system dashboard</title>
+PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Prediction-market engine — status</title>
 <style>
-  :root {
-    --bg:#0b0e14; --panel:#141925; --panel2:#1b2230; --line:#283142;
-    --txt:#e6edf3; --muted:#8b98a9; --green:#3fb950; --red:#f85149;
-    --amber:#d29922; --accent:#58a6ff;
+  :root{
+    --bg:#f7f7f5; --panel:#fff; --line:#e4e4e0; --txt:#1c1c1a; --muted:#6b6b66;
+    --good:#1d8a5e; --good-bg:#e6f4ec; --info:#1f6feb; --info-bg:#e8f0fe;
+    --warn:#9a6a00; --warn-bg:#fbf0d9; --muted-bg:#efefec;
   }
-  * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--txt);
-    font:14px/1.5 ui-sans-serif,system-ui,"Segoe UI",Roboto,sans-serif; }
-  header { display:flex; align-items:center; gap:14px; padding:16px 22px;
-    border-bottom:1px solid var(--line); background:var(--panel); position:sticky; top:0; }
-  header h1 { font-size:16px; margin:0; font-weight:600; letter-spacing:.3px; }
-  header .sub { color:var(--muted); font-size:12px; }
-  header .pill { margin-left:auto; font-size:12px; color:var(--muted); }
-  .signal-only { background:rgba(210,153,34,.15); color:var(--amber);
-    border:1px solid rgba(210,153,34,.4); padding:3px 9px; border-radius:999px; font-size:11px; font-weight:600; }
-  main { padding:22px; max-width:1200px; margin:0 auto; }
-  .grid { display:grid; gap:14px; }
-  .cards { grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); margin-bottom:18px; }
-  .card { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
-  .card .label { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.6px; }
-  .card .value { font-size:26px; font-weight:650; margin-top:4px; }
-  .card .value small { font-size:13px; color:var(--muted); font-weight:400; }
-  .compact { grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); margin-bottom:16px; }
-  .compact .card { padding:10px 12px; border-radius:8px; }
-  .compact .card .value { font-size:20px; }
-  .tabs { display:flex; flex-wrap:wrap; gap:6px; margin:0 0 18px; border-bottom:1px solid var(--line); }
-  .tab-btn { appearance:none; border:1px solid transparent; border-bottom:none; background:transparent;
-    color:var(--muted); cursor:pointer; font:inherit; font-size:13px; padding:9px 12px;
-    border-radius:8px 8px 0 0; }
-  .tab-btn:hover { color:var(--txt); background:rgba(88,166,255,.08); }
-  .tab-btn.active { color:var(--txt); background:var(--panel); border-color:var(--line); }
-  .tab-panel { display:none; }
-  .tab-panel.active { display:block; }
-  section { background:var(--panel); border:1px solid var(--line); border-radius:10px;
-    padding:16px 18px; margin-bottom:18px; }
-  section h2 { font-size:13px; margin:0 0 12px; color:var(--muted);
-    text-transform:uppercase; letter-spacing:.6px; font-weight:600; }
-  section h3 { font-size:12px; margin:18px 0 8px; color:var(--muted);
-    text-transform:uppercase; letter-spacing:.5px; font-weight:600; }
-  .two { display:grid; grid-template-columns:1fr 1fr; gap:18px; }
-  @media (max-width:820px){ .two{ grid-template-columns:1fr; } }
-  table { width:100%; border-collapse:collapse; font-size:13px; }
-  th,td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); }
-  th { color:var(--muted); font-weight:500; font-size:11px; text-transform:uppercase; letter-spacing:.4px; }
-  td.num,th.num { text-align:right; font-variant-numeric:tabular-nums; }
-  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:8px; vertical-align:middle; }
-  .dot.ok { background:var(--green); box-shadow:0 0 7px var(--green); }
-  .dot.bad { background:var(--red); box-shadow:0 0 7px var(--red); }
-  .comp-row { display:flex; align-items:center; padding:8px 0; border-bottom:1px solid var(--line); }
-  .comp-row:last-child { border-bottom:none; }
-  .comp-name { font-weight:600; width:150px; }
-  .comp-detail { color:var(--muted); font-size:12px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .comp-age { color:var(--muted); font-variant-numeric:tabular-nums; }
-  .empty { color:var(--muted); font-style:italic; padding:10px 0; }
-  .bar { height:6px; border-radius:3px; background:var(--panel2); overflow:hidden; margin-top:5px; }
-  .bar > i { display:block; height:100%; background:var(--accent); }
-  .cat-row { display:flex; justify-content:space-between; font-size:12px; padding:2px 0; }
-  .tag { font-size:10px; padding:1px 6px; border-radius:4px; background:var(--panel2); color:var(--muted); }
-  a.ext { color:var(--accent); text-decoration:none; }
-  a.ext:hover { text-decoration:underline; }
-  .err { color:var(--red); }
-</style>
-</head>
-<body>
-<header>
-  <h1>pm-system</h1>
-  <span class="sub">Phase 0 · Polymarket</span>
-  <span class="signal-only">SIGNAL-ONLY · no live orders</span>
-  <span class="pill" id="updated">connecting…</span>
-</header>
-<main>
-  <div class="grid cards" id="cards"></div>
-  <nav class="tabs" aria-label="Dashboard views" role="tablist">
-    <button class="tab-btn" type="button" role="tab" data-tab="paper" aria-controls="tab-paper">Paper</button>
-    <button class="tab-btn" type="button" role="tab" data-tab="signals" aria-controls="tab-signals">Signals</button>
-    <button class="tab-btn" type="button" role="tab" data-tab="performance" aria-controls="tab-performance">Performance</button>
-    <button class="tab-btn" type="button" role="tab" data-tab="execution" aria-controls="tab-execution">Execution</button>
-    <button class="tab-btn" type="button" role="tab" data-tab="markets" aria-controls="tab-markets">Markets</button>
-    <button class="tab-btn" type="button" role="tab" data-tab="health" aria-controls="tab-health">Health</button>
-  </nav>
-  <div class="tab-panel" id="tab-paper" role="tabpanel">
-    <section>
-      <h2>Paper portfolio ($50 bankroll)</h2>
-      <div id="paperportfolio"></div>
-      <h3>Strategy selection</h3>
-      <div id="strategyselect"></div>
-      <h3>Bet sizing / paper trades</h3>
-      <div id="betsizing"></div>
-      <h3>Paper positions</h3>
-      <div id="paperpositions"></div>
-    </section>
+  @media (prefers-color-scheme: dark){
+    :root{ --bg:#161614; --panel:#1f1f1d; --line:#33332f; --txt:#ececea;
+      --muted:#9a9a92; --good:#4ec38a; --good-bg:#13241c; --info:#6ea8ff;
+      --info-bg:#15233d; --warn:#e0b25a; --warn-bg:#2a2310; --muted-bg:#26261f; }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+    font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;}
+  .wrap{max-width:820px;margin:0 auto;padding:28px 20px 60px;}
+  h1{font-size:22px;font-weight:600;margin:0 0 4px;}
+  .sub{color:var(--muted);margin:0 0 22px;font-size:15px;}
+  .banner{display:flex;align-items:center;gap:12px;background:var(--panel);
+    border:1px solid var(--line);border-radius:12px;padding:14px 18px;margin-bottom:22px;}
+  .big-dot{width:12px;height:12px;border-radius:50%;flex:none;}
+  .ok-dot{background:var(--good)} .bad-dot{background:#d4564f}
+  .banner b{font-weight:600}
+  .stat-row{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:28px;}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;}
+  .stat .v{font-size:24px;font-weight:600;}
+  .stat .l{font-size:13px;color:var(--muted);margin-top:2px;}
+  h2{font-size:17px;font-weight:600;margin:30px 0 12px;}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:16px 18px;margin-bottom:12px;}
+  .card-top{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:6px;}
+  .card-top .nm{font-weight:600;font-size:16px;}
+  .badge{font-size:12px;font-weight:600;padding:3px 10px;border-radius:999px;white-space:nowrap;}
+  .badge.good{background:var(--good-bg);color:var(--good);}
+  .badge.info{background:var(--info-bg);color:var(--info);}
+  .badge.warn{background:var(--warn-bg);color:var(--warn);}
+  .badge.muted{background:var(--muted-bg);color:var(--muted);}
+  .plain{color:var(--txt);margin:0 0 8px;font-size:14.5px;}
+  .status{color:var(--muted);font-size:13.5px;margin:0;}
+  .count-chip{margin-left:auto;font-size:13px;color:var(--muted);font-variant-numeric:tabular-nums;}
+  details{margin-top:24px;border-top:1px solid var(--line);padding-top:14px;}
+  summary{cursor:pointer;color:var(--muted);font-size:14px;}
+  .comp{display:flex;align-items:center;gap:8px;padding:5px 0;font-size:13px;
+    border-bottom:1px solid var(--line);}
+  .comp:last-child{border-bottom:none}
+  .comp .d{width:8px;height:8px;border-radius:50%;flex:none;}
+  .comp .nm{min-width:130px;font-weight:500;}
+  .comp .dt{color:var(--muted);font-size:12px;}
+  .foot{color:var(--muted);font-size:12px;margin-top:26px;text-align:center;}
+  .learned{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:16px 18px;font-size:14.5px;}
+  .learned p{margin:0 0 10px;} .learned p:last-child{margin:0;}
+  .learned b{font-weight:600;}
+</style></head>
+<body><div class="wrap">
+  <h1>Prediction-market engine</h1>
+  <p class="sub">A research tool that watches Polymarket and tests ways to predict
+    price moves. It places <b>no real trades</b> — everything here is observation.</p>
+
+  <div class="banner">
+    <span id="bigdot" class="big-dot ok-dot"></span>
+    <div><b id="bannermain">Loading…</b><div class="sub" style="margin:0" id="bannersub"></div></div>
   </div>
-  <div class="tab-panel" id="tab-signals" role="tabpanel">
-    <section>
-      <h2>Recent signals</h2>
-      <div id="signals"></div>
-    </section>
-    <section>
-      <h2>Secondary diagnostics</h2>
-      <div id="earnings"></div>
-    </section>
+
+  <div class="stat-row" id="stats"></div>
+
+  <h2>What it's testing</h2>
+  <div id="strategies"></div>
+
+  <h2>What we've learned so far</h2>
+  <div class="learned">
+    <p><b>One thing clearly works but is rare:</b> risk-free arbitrage — when the
+      pieces of an event sell for less than they're guaranteed to pay. Real, but
+      shows up only occasionally.</p>
+    <p><b>The short-term order-book patterns were a dead end.</b> After the small
+      trading fee, they don't beat a coin flip. We keep recording them for the
+      write-up, but they're not worth trading.</p>
+    <p><b>The current live experiment is copying proven wallets.</b> The system is
+      watching big blockchain bettors and scoring them as their bets settle. In a
+      few days we'll know whether any of them are reliably skilled.</p>
+    <p><b>Nothing is wired to spend money.</b> Trading stays switched off until a
+      strategy proves itself and is reviewed.</p>
   </div>
-  <div class="tab-panel" id="tab-performance" role="tabpanel">
-    <section>
-      <h2>Signal performance (labeled forward returns)</h2>
-      <div class="grid cards compact" id="signalstats"></div>
-      <h3>Strategy aggregates</h3>
-      <div id="strategyagg"></div>
-      <h3>Strategy / kind detail</h3>
-      <div id="signalperf"></div>
-    </section>
-  </div>
-  <div class="tab-panel" id="tab-execution" role="tabpanel">
-    <section>
-      <h2>Recent execution</h2>
-      <div id="execution"></div>
-    </section>
-  </div>
-  <div class="tab-panel" id="tab-markets" role="tabpanel">
-    <section>
-      <h2>Top tracked markets by liquidity</h2>
-      <div id="markets"></div>
-    </section>
-  </div>
-  <div class="tab-panel" id="tab-health" role="tabpanel">
-    <div class="two">
-      <section>
-        <h2>Component health</h2>
-        <div id="components"></div>
-      </section>
-      <section>
-        <h2>Recon (WS vs REST)</h2>
-        <div id="recon"></div>
-        <h2 style="margin-top:18px">Categories</h2>
-        <div id="categories"></div>
-      </section>
-    </div>
-  </div>
-</main>
+
+  <details>
+    <summary>System health (for the technical reader)</summary>
+    <div id="components" style="margin-top:12px"></div>
+  </details>
+
+  <p class="foot" id="foot"></p>
+</div>
 <script>
-const $ = id => document.getElementById(id);
-const fmtMoney = v => v == null ? "n/a" : (Number(v) < 0 ? "-$" : "$") +
-  Math.abs(Number(v)).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-const fmtAge = s => s == null ? "—" : (s < 90 ? s.toFixed(0)+"s" : (s/60).toFixed(1)+"m");
-const fmtUsd = v => v == null ? "—" : "$" + Math.round(v).toLocaleString();
-const esc = s => {
-  const span = document.createElement("span");
-  span.textContent = String(s ?? "");
-  return span.innerHTML;
-};
-const short = (s, n=18) => String(s ?? "").slice(0, n);
-const extLink = (url, label, title) => url
-  ? `<a class="ext" href="${esc(url)}" title="${esc(title || url)}">${esc(label)}</a>`
-  : esc(label);
-const tokenLinks = tokens => (tokens || []).map(t =>
-  extLink(t.url, `${t.side}:${short(t.token_id, 8)}`, `${t.question || t.slug || "Polymarket market"}\n${t.token_id}`)
-).join(" ");
-const tabButtons = Array.from(document.querySelectorAll(".tab-btn"));
-const tabPanels = Array.from(document.querySelectorAll(".tab-panel"));
-const tabNames = new Set(tabButtons.map(btn => btn.dataset.tab));
+function ago(s){ if(s==null) return "never"; if(s<60) return Math.round(s)+"s ago";
+  if(s<3600) return Math.round(s/60)+"m ago"; return Math.round(s/3600)+"h ago"; }
+function num(n){ return (n||0).toLocaleString(); }
 
-function setTab(tabName) {
-  const active = tabNames.has(tabName) ? tabName : "paper";
-  tabButtons.forEach(btn => {
-    const isActive = btn.dataset.tab === active;
-    btn.classList.toggle("active", isActive);
-    btn.setAttribute("aria-selected", isActive ? "true" : "false");
-  });
-  tabPanels.forEach(panel => {
-    const isActive = panel.id === `tab-${active}`;
-    panel.classList.toggle("active", isActive);
-    panel.hidden = !isActive;
-  });
-  localStorage.setItem("pm-dashboard-tab", active);
+async function refresh(){
+  let d;
+  try{ d = await (await fetch("/api/state")).json(); }
+  catch(e){ document.getElementById("bannermain").textContent="Dashboard can't reach the engine."; return; }
+
+  const engineUp = d.engine.ok;
+  const allOk = engineUp && d.components_ok === d.components_total;
+  document.getElementById("bigdot").className = "big-dot " + (allOk ? "ok-dot" : "bad-dot");
+  document.getElementById("bannermain").textContent = engineUp
+    ? (allOk ? "Everything is running normally." : "Running, with one or more parts catching up.")
+    : "The engine is not running.";
+  document.getElementById("bannersub").textContent =
+    d.components_ok + " of " + d.components_total + " parts healthy · engine heartbeat " + ago(d.engine.age_s);
+
+  const c = d.counts;
+  document.getElementById("stats").innerHTML = [
+    ["Markets watched", num(c.markets_active)],
+    ["Signals recorded", num(c.signals)],
+    ["Wallets found", num(d.whale.wallets)],
+    ["Real trades", num(c.real_trades) + (c.real_trades===0 ? " · off" : "")],
+  ].map(([l,v]) => `<div class="stat"><div class="v">${v}</div><div class="l">${l}</div></div>`).join("");
+
+  document.getElementById("strategies").innerHTML = d.strategies.map(s => `
+    <div class="card">
+      <div class="card-top">
+        <span class="nm">${s.name}</span>
+        <span class="badge ${s.tier_color}">${s.tier_label}</span>
+        <span class="count-chip">${num(s.signals)} signals</span>
+      </div>
+      <p class="plain">${s.plain}</p>
+      <p class="status">${s.status}</p>
+    </div>`).join("");
+
+  document.getElementById("components").innerHTML = d.components.map(c => `
+    <div class="comp">
+      <span class="d" style="background:${c.ok ? 'var(--good)' : '#d4564f'}"></span>
+      <span class="nm">${c.component}</span>
+      <span class="dt">${ago(c.age_s)}${c.detail ? " · " + c.detail : ""}</span>
+    </div>`).join("");
+
+  document.getElementById("foot").textContent = "Updated " + new Date().toLocaleTimeString()
+    + " · refreshes every 5s · read-only";
 }
-
-tabButtons.forEach(btn => btn.addEventListener("click", () => setTab(btn.dataset.tab)));
-setTab(localStorage.getItem("pm-dashboard-tab") || "paper");
-
-function card(label, value, sub) {
-  return `<div class="card"><div class="label">${label}</div>
-    <div class="value">${value}${sub ? ` <small>${sub}</small>` : ""}</div></div>`;
-}
-
-async function refresh() {
-  let s;
-  try { s = await (await fetch("/api/state")).json(); }
-  catch (e) { $("updated").innerHTML = '<span class="err">engine/db unreachable</span>'; return; }
-
-  const hb = s.engine_heartbeat, el = s.event_log;
-  const pp = s.paper_portfolio;
-  $("cards").innerHTML =
-    card("Markets", s.counts.markets.toLocaleString()) +
-    card("NegRisk groups", s.counts.neg_risk_groups.toLocaleString()) +
-    card("Signals fired", s.counts.signals.toLocaleString()) +
-    card("Portfolio", fmtMoney(pp.bankroll)) +
-    card("Paper PnL", fmtMoney(pp.total_pnl), "marked") +
-    card("Paper cash", fmtMoney(pp.cash)) +
-    card("Position value", fmtMoney(pp.open_value)) +
-    card("Paper bets", pp.selected_bets.toLocaleString()) +
-    card("Exec intents", s.counts.execution_intents.toLocaleString()) +
-    card("Risk events", s.counts.risk_events.toLocaleString()) +
-    card("Recon rows", s.counts.recon_rows.toLocaleString()) +
-    card("Engine HB", (hb.stale ? '<span class="err">stale</span>' : "live"), fmtAge(hb.age_s)) +
-    card("Event log", el.exists ? el.size_mb + " MB" : '<span class="err">none</span>',
-         el.exists ? fmtAge(el.age_s) + " ago" : "");
-
-  $("components").innerHTML = s.components.length ? s.components.map(c =>
-    `<div class="comp-row"><span class="dot ${c.stale?'bad':'ok'}"></span>
-      <span class="comp-name">${esc(c.component)}</span>
-      <span class="comp-detail">${esc(c.detail)}</span>
-      <span class="comp-age">${fmtAge(c.age_s)}</span></div>`).join("")
-    : '<div class="empty">no heartbeats yet</div>';
-
-  const r = s.recon;
-  const driftClass = r.max_abs_diff > 0.02 ? "err" : "";
-  $("recon").innerHTML =
-    `<table><tr><th>max |diff|</th><th class="num">drift events (1h)</th><th class="num">rows (1h)</th></tr>
-     <tr><td class="${driftClass}">${r.max_abs_diff.toFixed(4)}</td>
-     <td class="num">${r.drift_count}</td><td class="num">${r.recent}</td></tr></table>`;
-
-  const maxCat = Math.max(1, ...s.categories.map(c => c.n));
-  $("categories").innerHTML = s.categories.length ? s.categories.map(c =>
-    `<div class="cat-row"><span>${esc(c.category)}</span><span>${c.n.toLocaleString()}</span></div>
-     <div class="bar"><i style="width:${(c.n/maxCat*100).toFixed(1)}%"></i></div>`).join("")
-    : '<div class="empty">no markets yet</div>';
-
-  $("paperportfolio").innerHTML =
-    `<table><tr><th>metric</th><th class="num">value</th></tr>
-      <tr><td>Starting bankroll</td><td class="num">${fmtMoney(pp.bankroll)}</td></tr>
-      <tr><td>Paper PnL</td><td class="num">${fmtMoney(pp.total_pnl)}</td></tr>
-      <tr><td>Realized paper PnL</td><td class="num">${fmtMoney(pp.realized_pnl)}</td></tr>
-      <tr><td>Open/settled position PnL</td><td class="num">${fmtMoney(pp.unrealized_pnl)}</td></tr>
-      <tr><td>Cash</td><td class="num">${fmtMoney(pp.cash)}</td></tr>
-      <tr><td>Open position cost</td><td class="num">${fmtMoney(pp.open_cost)}</td></tr>
-      <tr><td>Open/settled position value</td><td class="num">${fmtMoney(pp.open_value)}</td></tr>
-      <tr><td>Equity marked</td><td class="num">${fmtMoney(pp.equity)}</td></tr>
-      <tr><td>Equity at cost</td><td class="num">${fmtMoney(pp.equity_at_cost)}</td></tr>
-      <tr><td>Deployed notional</td><td class="num">${fmtMoney(pp.deployed_notional)}</td></tr>
-      <tr><td>Sold notional</td><td class="num">${fmtMoney(pp.sold_notional)}</td></tr>
-      <tr><td>Strategy scope</td><td class="num">${esc(pp.strategy_scope)}</td></tr></table>
-      <div class="empty">${esc(pp.note)}</div>`;
-
-  $("strategyselect").innerHTML = pp.strategy_selection.length ?
-    `<table><tr><th>strategy</th><th>kind</th><th>status</th><th class="num">signals</th>
-       <th class="num">exec</th><th class="num">picked</th><th class="num">notional</th>
-       <th class="num">paper PnL</th><th class="num">sim PnL</th></tr>` +
-    pp.strategy_selection.map(p => `<tr><td><span class="tag">${esc(p.strategy)}</span></td>
-      <td>${esc(p.kind)}</td><td>${esc(p.status)}</td>
-      <td class="num">${p.signals}</td><td class="num">${p.executable}</td>
-      <td class="num">${p.selected}</td><td class="num">${fmtMoney(p.notional)}</td>
-      <td class="num">${fmtMoney(p.paper_pnl)}</td><td class="num">${fmtMoney(p.sim_pnl)}</td></tr>`).join("") + `</table>`
-    : '<div class="empty">no strategy rows yet</div>';
-
-  $("betsizing").innerHTML = pp.decisions.length ?
-    `<table><tr><th>signal</th><th>strategy</th><th>kind</th><th>tokens</th><th>action</th><th>status</th>
-       <th>reason</th><th class="num">$/set</th><th class="num">sets</th>
-       <th class="num">notional</th><th class="num">edge</th><th class="num">paper PnL</th>
-       <th class="num">sim PnL</th></tr>` +
-    pp.decisions.map(d => `<tr><td>${d.signal_id}</td><td><span class="tag">${esc(d.strategy)}</span></td>
-      <td>${esc(d.kind)}</td><td>${tokenLinks(d.tokens)}</td><td>${esc(d.action)}</td><td>${esc(d.status)}</td>
-      <td>${esc(d.reason)}</td><td class="num">${fmtMoney(d.cost_per_set)}</td>
-      <td class="num">${Number(d.sets).toFixed(2)}</td><td class="num">${fmtMoney(d.notional)}</td>
-      <td class="num">${Number(d.net_edge).toFixed(4)}</td><td class="num">${fmtMoney(d.paper_pnl)}</td>
-      <td class="num">${fmtMoney(d.sim_pnl)}</td></tr>`).join("") + `</table>`
-    : '<div class="empty">no executable paper decisions yet</div>';
-
-  $("paperpositions").innerHTML = pp.positions.length ?
-    `<table><tr><th>token</th><th>market</th><th>status</th><th class="num">shares</th>
-       <th class="num">avg price</th><th class="num">mark</th>
-       <th class="num">cost</th><th class="num">value</th><th class="num">PnL</th></tr>` +
-    pp.positions.map(p => `<tr><td>${extLink(p.url, short(p.token_id, 18), p.question || p.slug || p.token_id)}</td>
-      <td>${extLink(p.url, short(p.market_id, 18), p.question || p.slug || p.market_id)}</td>
-      <td>${esc(p.status)}</td>
-      <td class="num">${Number(p.size).toFixed(2)}</td>
-      <td class="num">${Number(p.avg_price).toFixed(4)}</td>
-      <td class="num">${p.mark_price == null ? "—" : Number(p.mark_price).toFixed(4)}</td>
-      <td class="num">${fmtMoney(p.cost)}</td>
-      <td class="num">${fmtMoney(p.value)}</td>
-      <td class="num">${fmtMoney(p.pnl)}</td></tr>`).join("") + `</table>`
-    : '<div class="empty">no open paper positions</div>';
-
-  $("signals").innerHTML = s.signals.length ?
-    `<table><tr><th>id</th><th>strategy</th><th>kind</th><th>group</th><th class="num">net edge</th>
-       <th class="num">sets</th><th class="num">outcome</th><th class="num">age</th></tr>` +
-    s.signals.map(g => `<tr><td>${g.signal_id}</td><td><span class="tag">${esc(g.strategy)}</span></td>
-      <td>${esc(g.kind)}</td>
-      <td>${esc((g.group_id||"").slice(0,18))}…</td>
-      <td class="num">${g.net_edge.toFixed(4)}</td><td class="num">${g.exec_sets.toFixed(1)}</td>
-      <td class="num">${g.outcome == null ? "—" : g.outcome.toFixed(4)}</td>
-      <td class="num">${fmtAge(s.now - g.ts)}</td></tr>`).join("") + `</table>`
-    : '<div class="empty">no signals fired yet — expected when no arb exists (system is signal-only)</div>';
-
-  $("earnings").innerHTML =
-    `<table><tr><th>metric</th><th class="num">value</th></tr>
-      <tr><td>Signal EV at full quoted depth</td><td class="num">${fmtMoney(s.earnings.signal_ev)}</td></tr>
-      <tr><td>Labeler sim PnL at full quoted depth</td><td class="num">${fmtMoney(s.earnings.labeled_sim_pnl)}</td></tr>
-      <tr><td>Execution-fill realized PnL</td><td class="num">${fmtMoney(s.earnings.paper_realized_pnl)}</td></tr>
-      <tr><td>Execution-fill open cost</td><td class="num">${fmtMoney(s.earnings.paper_open_cost)}</td></tr>
-      <tr><td>Execution-fill notional</td><td class="num">${fmtMoney(s.earnings.filled_notional)}</td></tr></table>`;
-
-  const ss = s.signal_summary;
-  $("signalstats").innerHTML =
-    card("Total signals", Number(ss.signals || 0).toLocaleString()) +
-    card("Labeled", Number(ss.labeled || 0).toLocaleString(),
-         `${Number(ss.signals || 0) ? (ss.labeled / ss.signals * 100).toFixed(0) : 0}%`) +
-    card("Executable", Number(ss.executable || 0).toLocaleString()) +
-    card("Hit rate", ss.labeled ? (ss.hit_rate * 100).toFixed(0) + "%" : "—") +
-    card("Avg fwd edge", ss.labeled ? (ss.avg_outcome >= 0 ? "+" : "") + ss.avg_outcome.toFixed(4) : "—") +
-    card("Signal EV", fmtMoney(ss.signal_ev)) +
-    card("Sim PnL", fmtMoney(ss.sim_pnl));
-
-  $("strategyagg").innerHTML = s.signal_by_strategy.length ?
-    `<table><tr><th>strategy</th><th class="num">signals</th><th class="num">exec</th>
-       <th class="num">labeled</th><th class="num">coverage</th><th class="num">hit rate</th>
-       <th class="num">avg fwd edge</th><th class="num">signal EV</th><th class="num">sim PnL</th></tr>` +
-    s.signal_by_strategy.map(p => `<tr><td><span class="tag">${esc(p.strategy)}</span></td>
-      <td class="num">${p.signals}</td><td class="num">${p.executable}</td>
-      <td class="num">${p.labeled}</td>
-      <td class="num">${p.signals ? (p.labeled / p.signals * 100).toFixed(0)+"%" : "—"}</td>
-      <td class="num">${p.labeled ? (p.hit_rate*100).toFixed(0)+"%" : "—"}</td>
-      <td class="num">${p.labeled ? (p.avg_outcome>=0?"+":"")+p.avg_outcome.toFixed(4) : "—"}</td>
-      <td class="num">${fmtMoney(p.signal_ev)}</td>
-      <td class="num">${fmtMoney(p.sim_pnl)}</td></tr>`).join("") + `</table>`
-    : '<div class="empty">no strategy aggregates yet</div>';
-
-  $("signalperf").innerHTML = s.signal_perf.length ?
-    `<table><tr><th>strategy</th><th>kind</th><th class="num">signals</th>
-       <th class="num">labeled</th><th class="num">hit rate</th><th class="num">avg fwd edge</th>
-       <th class="num">signal EV</th><th class="num">sim PnL</th></tr>` +
-    s.signal_perf.map(p => `<tr><td><span class="tag">${esc(p.strategy)}</span></td>
-      <td>${esc(p.kind)}</td><td class="num">${p.n}</td><td class="num">${p.labeled}</td>
-      <td class="num">${p.labeled ? (p.hit_rate*100).toFixed(0)+"%" : "—"}</td>
-      <td class="num">${p.labeled ? (p.avg_outcome>=0?"+":"")+p.avg_outcome.toFixed(4) : "—"}</td>
-      <td class="num">${fmtMoney(p.signal_ev)}</td>
-      <td class="num">${fmtMoney(p.sim_pnl)}</td>
-      </tr>`).join("") + `</table>`
-    : '<div class="empty">no signals to evaluate yet</div>';
-
-  $("execution").innerHTML = s.execution.length ?
-    `<table><tr><th>id</th><th>signal</th><th>kind</th><th>token</th><th>side</th>
-       <th class="num">price</th><th class="num">size</th><th class="num">notional</th>
-       <th>status</th><th>reason</th></tr>` +
-    s.execution.map(e => `<tr><td>${e.intent_id}</td><td>${e.signal_id ?? ""}</td>
-      <td>${esc(e.kind)}</td><td>${esc((e.token_id||"").slice(0,18))}</td><td>${esc(e.side)}</td>
-      <td class="num">${Number(e.price).toFixed(4)}</td>
-      <td class="num">${Number(e.size).toFixed(1)}</td>
-      <td class="num">${fmtUsd(e.notional)}</td>
-      <td>${esc(e.status)}</td><td>${esc((e.reason||"").slice(0,60))}</td></tr>`).join("") + `</table>`
-    : '<div class="empty">execution disabled or no signal has passed into execution yet</div>';
-
-  $("markets").innerHTML = s.top_markets.length ?
-    `<table><tr><th>question</th><th>category</th><th>negrisk</th><th class="num">liquidity</th></tr>` +
-    s.top_markets.map(m => `<tr><td>${esc((m.question||"").slice(0,70))}</td>
-      <td><span class="tag">${esc(m.category||"—")}</span></td>
-      <td>${m.neg_risk ? "✓" : ""}</td>
-      <td class="num">${fmtUsd(m.liquidity)}</td></tr>`).join("") + `</table>`
-    : '<div class="empty">no markets yet</div>';
-
-  const d = new Date(s.now * 1000);
-  $("updated").textContent = "updated " + d.toLocaleTimeString();
-}
-refresh();
-setInterval(refresh, 3000);
+refresh(); setInterval(refresh, 5000);
 </script>
-</body>
-</html>
+</body></html>
 """
 
 
-def make_app(settings) -> web.Application:
+async def handle_index(request: web.Request) -> web.Response:
+    return web.Response(text=PAGE, content_type="text/html")
+
+
+def make_app(settings: Settings) -> web.Application:
     app = web.Application()
     app["settings"] = settings
     app["conn"] = db.connect(settings.db_path)
@@ -853,11 +360,13 @@ def make_app(settings) -> web.Application:
 
 
 def main() -> None:
+    import logging
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
     settings = Settings()
     app = make_app(settings)
-    log.info("dashboard at http://%s:%d", settings.dashboard_host, settings.dashboard_port)
+    logging.getLogger(__name__).info(
+        "dashboard at http://%s:%d", settings.dashboard_host, settings.dashboard_port)
     web.run_app(app, host=settings.dashboard_host, port=settings.dashboard_port,
                 print=None)
 
