@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 
 import pytest
 
@@ -35,7 +36,8 @@ def _signal(conn, *, kind: str, legs: list[dict], exec_sets: float,
     return signal_id
 
 
-def _market(conn, market_id: str, slug: str, question: str, token: str) -> None:
+def _market(conn, market_id: str, slug: str, question: str, token: str, *,
+            closed: int = 0, outcome_prices: list[float] | None = None) -> None:
     db.upsert_market(conn, {
         "market_id": market_id,
         "venue": "polymarket",
@@ -43,8 +45,10 @@ def _market(conn, market_id: str, slug: str, question: str, token: str) -> None:
         "slug": slug,
         "category": "sports",
         "active": 1,
-        "closed": 0,
+        "closed": closed,
         "token_yes": token,
+        "token_no": f"{token}_NO",
+        "outcome_prices_json": json.dumps(outcome_prices) if outcome_prices is not None else None,
     })
 
 
@@ -130,3 +134,27 @@ def test_paper_portfolio_marks_zero_exec_rows_as_unsized(tmp_path):
 
     assert portfolio["selected_bets"] == 0
     assert portfolio["strategy_selection"][0]["status"] == "no executable size"
+
+
+def test_paper_portfolio_marks_resolved_positions_to_outcome_price(tmp_path):
+    conn = db.connect(tmp_path / "state.db")
+    _market(conn, "MA", "market-a", "Market A", "A", closed=1, outcome_prices=[1.0, 0.0])
+    _signal(
+        conn,
+        kind="single_buy",
+        legs=[{"token_id": "A", "market_id": "MA", "side": "BUY", "price": 0.40, "size": 10}],
+        exec_sets=10.0,
+        net_edge=0.05,
+        outcome=0.0,
+        ts=1.0,
+    )
+
+    portfolio = dashboard._paper_portfolio(conn, _Settings())
+
+    assert portfolio["open_cost"] == pytest.approx(4.0)
+    assert portfolio["open_value"] == pytest.approx(10.0)
+    assert portfolio["unrealized_pnl"] == pytest.approx(6.0)
+    assert portfolio["total_pnl"] == pytest.approx(6.0)
+    assert portfolio["total_pnl_at_cost"] == pytest.approx(0.0)
+    assert portfolio["positions"][0]["status"] == "resolved"
+    assert portfolio["positions"][0]["mark_price"] == 1.0

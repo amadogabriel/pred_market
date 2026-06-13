@@ -24,6 +24,10 @@ CREATE TABLE IF NOT EXISTS markets (
     end_date      TEXT,
     active        INTEGER,
     closed        INTEGER,
+    accepting_orders INTEGER,
+    outcome_prices_json TEXT,
+    resolution_status TEXT,
+    closed_time   TEXT,
     neg_risk      INTEGER DEFAULT 0,
     neg_risk_id   TEXT,               -- groups mutually exclusive outcomes
     token_yes     TEXT,
@@ -153,13 +157,29 @@ def connect(db_path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL;")
     conn.execute("PRAGMA busy_timeout=5000;")
     conn.executescript(SCHEMA)
+    _ensure_market_columns(conn)
     return conn
 
 
 # ---------- helpers ----------
 
+def _ensure_market_columns(conn: sqlite3.Connection) -> None:
+    """Add columns introduced after the initial SQLite schema was created."""
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(markets)")}
+    extras = {
+        "accepting_orders": "INTEGER",
+        "outcome_prices_json": "TEXT",
+        "resolution_status": "TEXT",
+        "closed_time": "TEXT",
+    }
+    for name, ddl in extras.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE markets ADD COLUMN {name} {ddl}")
+
+
 def upsert_market(conn: sqlite3.Connection, m: dict[str, Any]) -> None:
     cols = ("market_id venue question slug category tags_json end_date active closed "
+            "accepting_orders outcome_prices_json resolution_status closed_time "
             "neg_risk neg_risk_id token_yes token_no liquidity volume_24h updated_at").split()
     m = {**m, "updated_at": time.time()}
     placeholders = ",".join(":" + c for c in cols)

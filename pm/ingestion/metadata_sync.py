@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 import aiohttp
@@ -34,6 +35,8 @@ log = logging.getLogger(__name__)
 # sync to ~10s and avoids blocking the event loop on tens of thousands of
 # synchronous upserts (which can starve the WS keepalive and force reconnects).
 MAX_EVENTS = 400
+MAX_CLOSED_REFRESH = 500
+CLOSED_REFRESH_CONCURRENCY = 10
 
 # Gamma categories we know how to price (must match keys in config/fees.yaml).
 KNOWN_CATEGORIES = {
@@ -124,6 +127,18 @@ def _as_float(v: Any) -> float | None:
         return None
 
 
+def _json_text(raw: Any) -> str | None:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        try:
+            json.loads(raw)
+            return raw
+        except (TypeError, ValueError):
+            return json.dumps(raw)
+    return json.dumps(raw)
+
+
 def _category_from_tags(tags: Any) -> str | None:
     """Map an event's tag list to a fee-engine category (first match wins).
 
@@ -177,6 +192,12 @@ def parse_market(raw: dict[str, Any], *, category: str | None,
         "end_date": _first(raw, "endDate", "end_date"),
         "active": 1 if _first(raw, "active", default=True) else 0,
         "closed": 1 if _first(raw, "closed", default=False) else 0,
+        "accepting_orders": 1 if _first(raw, "acceptingOrders", "accepting_orders",
+                                        default=True) else 0,
+        "outcome_prices_json": _json_text(_first(raw, "outcomePrices", "outcome_prices")),
+        "resolution_status": _first(raw, "umaResolutionStatus", "resolutionStatus",
+                                    "resolution_status"),
+        "closed_time": _first(raw, "closedTime", "closed_time", "umaEndDate"),
         "neg_risk": 1 if neg_risk else 0,
         "neg_risk_id": neg_risk_id,
         "token_yes": tokens[0],
@@ -217,11 +238,68 @@ async def _fetch_events(session: aiohttp.ClientSession, settings) -> list[dict[s
     return out
 
 
+async def _fetch_market_by_slug(session: aiohttp.ClientSession, settings,
+                                slug: str) -> dict[str, Any] | None:
+    url = f"{settings.pm_gamma_rest.rstrip('/')}/markets/slug/{slug}"
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+        if resp.status == 404:
+            return None
+        resp.raise_for_status()
+        data = await resp.json()
+    return data if isinstance(data, dict) else None
+
+
+async def _refresh_past_end_markets(conn, session: aiohttp.ClientSession,
+                                    settings) -> int:
+    """Refresh stored markets that dropped out of the active/open event feed."""
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rows = conn.execute(
+        "SELECT market_id, slug, category, tags_json, neg_risk_id FROM markets "
+        "WHERE closed=0 AND slug IS NOT NULL AND end_date IS NOT NULL AND end_date <= ? "
+        "ORDER BY COALESCE(liquidity,0) DESC LIMIT ?",
+        (now_iso, MAX_CLOSED_REFRESH),
+    ).fetchall()
+    if not rows:
+        return 0
+
+    sem = asyncio.Semaphore(CLOSED_REFRESH_CONCURRENCY)
+
+    async def refresh(row) -> int:
+        async with sem:
+            try:
+                raw = await _fetch_market_by_slug(session, settings, row["slug"])
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                log.warning("metadata_sync: failed to refresh closed candidate %s",
+                            row["slug"], exc_info=True)
+                return 0
+        if not raw:
+            return 0
+        try:
+            tags = json.loads(row["tags_json"]) if row["tags_json"] else None
+        except (TypeError, ValueError):
+            tags = None
+        event = (raw.get("events") or [{}])[0]
+        category = row["category"] or _category_from_tags(event.get("tags"))
+        neg_risk_id = row["neg_risk_id"] or _event_group_id(event)
+        market = parse_market(raw, category=category, neg_risk_id=neg_risk_id, tags=tags)
+        if market is None:
+            return 0
+        upsert_market(conn, market)
+        return 1
+
+    refreshed = await asyncio.gather(*(refresh(row) for row in rows))
+    count = sum(refreshed)
+    if count:
+        log.info("metadata_sync: refreshed %d past-end markets", count)
+    return count
+
+
 async def sync_markets(conn, books: BookStore, ws: PolymarketWS, settings,
                        neg_risk_groups: dict[str, list[dict]] | None = None) -> int:
     """Run one full metadata sync pass. Returns the number of markets upserted."""
     async with aiohttp.ClientSession() as session:
         raw_events = await _fetch_events(session, settings)
+        closed_refreshed = await _refresh_past_end_markets(conn, session, settings)
 
     parsed: list[dict] = []
     all_groups: dict[str, list[dict]] = {}
@@ -280,9 +358,12 @@ async def sync_markets(conn, books: BookStore, ws: PolymarketWS, settings,
                  len(tracked), len(eligible), dropped)
     beat(conn, "metadata_sync",
          f"markets={len(parsed)} tracked={len(tracked)} tokens={len(tracked_tokens)} "
-         f"groups={len(groups)} rules_changed={rules_changed}")
-    log.info("metadata_sync: %d markets, %d tracked (%d tokens), %d NegRisk groups, %d rules changed",
-             len(parsed), len(tracked), len(tracked_tokens), len(groups), rules_changed)
+         f"groups={len(groups)} rules_changed={rules_changed} "
+         f"closed_refreshed={closed_refreshed}")
+    log.info("metadata_sync: %d markets, %d tracked (%d tokens), %d NegRisk groups, "
+             "%d rules changed, %d past-end refreshed",
+             len(parsed), len(tracked), len(tracked_tokens), len(groups),
+             rules_changed, closed_refreshed)
     return len(parsed)
 
 

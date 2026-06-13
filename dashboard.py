@@ -50,22 +50,53 @@ def _paper_portfolio(conn, settings) -> dict:
 
     def market_info(market_id: str | None) -> dict:
         if not market_id:
-            return {"slug": "", "question": "", "url": ""}
+            return {
+                "slug": "", "question": "", "url": "", "closed": False,
+                "token_yes": "", "token_no": "", "outcome_prices": [],
+                "resolution_status": "", "accepting_orders": None,
+            }
         if market_id not in market_meta:
             row = conn.execute(
-                "SELECT slug, question FROM markets WHERE market_id=?", (market_id,)).fetchone()
+                "SELECT slug, question, closed, accepting_orders, outcome_prices_json, "
+                "resolution_status, token_yes, token_no FROM markets WHERE market_id=?",
+                (market_id,)).fetchone()
             slug = str(row["slug"] or "") if row else ""
             question = str(row["question"] or "") if row else ""
+            outcome_prices = []
+            if row and row["outcome_prices_json"]:
+                try:
+                    outcome_prices = [float(v) for v in json.loads(row["outcome_prices_json"])]
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    outcome_prices = []
             search_query = question or str(market_id)
             market_meta[market_id] = {
                 "slug": slug,
                 "question": question,
+                "closed": bool(row["closed"]) if row else False,
+                "accepting_orders": (
+                    None if not row or row["accepting_orders"] is None
+                    else bool(row["accepting_orders"])
+                ),
+                "outcome_prices": outcome_prices,
+                "resolution_status": str(row["resolution_status"] or "") if row else "",
+                "token_yes": str(row["token_yes"] or "") if row else "",
+                "token_no": str(row["token_no"] or "") if row else "",
                 "url": (
                     f"https://polymarket.com/market/{slug}" if slug
                     else f"https://polymarket.com/search?query={quote_plus(search_query)}"
                 ),
             }
         return market_meta[market_id]
+
+    def position_mark_price(meta: dict, token_id: str) -> float | None:
+        prices = meta.get("outcome_prices") or []
+        if len(prices) < 2:
+            return None
+        if token_id == meta.get("token_yes"):
+            return float(prices[0])
+        if token_id == meta.get("token_no"):
+            return float(prices[1])
+        return None
 
     def linked_legs(legs: list[dict]) -> list[dict]:
         out = []
@@ -236,30 +267,48 @@ def _paper_portfolio(conn, settings) -> dict:
 
     open_positions = []
     open_cost = 0.0
+    open_value = 0.0
+    unrealized_pnl = 0.0
     for pos in positions.values():
         if pos["size"] <= 1e-9:
             continue
         meta = market_info(pos["market_id"])
         cost = pos["size"] * pos["avg_price"]
+        mark_price = position_mark_price(meta, pos["token_id"])
+        value = pos["size"] * mark_price if mark_price is not None else cost
+        pnl = value - cost
         open_cost += cost
+        open_value += value
+        unrealized_pnl += pnl
+        status = "resolved" if mark_price is not None else ("closed" if meta["closed"] else "open")
         open_positions.append({
             "token_id": pos["token_id"],
             "market_id": pos["market_id"],
             "url": meta["url"],
             "slug": meta["slug"],
             "question": meta["question"],
+            "status": status,
+            "resolution_status": meta["resolution_status"],
             "size": round(pos["size"], 4),
             "avg_price": round(pos["avg_price"], 4),
+            "mark_price": None if mark_price is None else round(mark_price, 4),
             "cost": round(cost, 4),
+            "value": round(value, 4),
+            "pnl": round(pnl, 4),
         })
 
     equity_at_cost = cash + open_cost
+    equity = cash + open_value
     return {
         "bankroll": round(bankroll, 4),
         "cash": round(cash, 4),
         "open_cost": round(open_cost, 4),
+        "open_value": round(open_value, 4),
         "equity_at_cost": round(equity_at_cost, 4),
+        "equity": round(equity, 4),
+        "unrealized_pnl": round(unrealized_pnl, 4),
         "realized_pnl": round(realized_pnl, 4),
+        "total_pnl": round(equity - bankroll, 4),
         "total_pnl_at_cost": round(equity_at_cost - bankroll, 4),
         "deployed_notional": round(deployed_notional, 4),
         "sold_notional": round(sold_notional, 4),
@@ -269,7 +318,7 @@ def _paper_portfolio(conn, settings) -> dict:
         "strategy_selection": list(strategy_rows.values()),
         "positions": open_positions[:PAPER_DECISION_LIMIT],
         "note": (
-            "Open positions are carried at cost; no live mark-to-market is available in state.db. "
+            "Open positions are carried at cost unless Gamma has final outcome prices. "
             "Rows with exec=0 are observations without executable sizing, not a strategy filter."
         ),
     }
@@ -512,7 +561,7 @@ INDEX_HTML = """<!DOCTYPE html>
       <div id="strategyselect"></div>
       <h3>Bet sizing / paper trades</h3>
       <div id="betsizing"></div>
-      <h3>Open paper positions</h3>
+      <h3>Paper positions</h3>
       <div id="paperpositions"></div>
     </section>
   </div>
@@ -620,9 +669,9 @@ async function refresh() {
     card("NegRisk groups", s.counts.neg_risk_groups.toLocaleString()) +
     card("Signals fired", s.counts.signals.toLocaleString()) +
     card("Portfolio", fmtMoney(pp.bankroll)) +
-    card("Paper PnL", fmtMoney(pp.total_pnl_at_cost), "at cost") +
+    card("Paper PnL", fmtMoney(pp.total_pnl), "marked") +
     card("Paper cash", fmtMoney(pp.cash)) +
-    card("Open cost", fmtMoney(pp.open_cost)) +
+    card("Position value", fmtMoney(pp.open_value)) +
     card("Paper bets", pp.selected_bets.toLocaleString()) +
     card("Exec intents", s.counts.execution_intents.toLocaleString()) +
     card("Risk events", s.counts.risk_events.toLocaleString()) +
@@ -654,10 +703,13 @@ async function refresh() {
   $("paperportfolio").innerHTML =
     `<table><tr><th>metric</th><th class="num">value</th></tr>
       <tr><td>Starting bankroll</td><td class="num">${fmtMoney(pp.bankroll)}</td></tr>
-      <tr><td>Paper PnL</td><td class="num">${fmtMoney(pp.total_pnl_at_cost)}</td></tr>
+      <tr><td>Paper PnL</td><td class="num">${fmtMoney(pp.total_pnl)}</td></tr>
       <tr><td>Realized paper PnL</td><td class="num">${fmtMoney(pp.realized_pnl)}</td></tr>
+      <tr><td>Open/settled position PnL</td><td class="num">${fmtMoney(pp.unrealized_pnl)}</td></tr>
       <tr><td>Cash</td><td class="num">${fmtMoney(pp.cash)}</td></tr>
       <tr><td>Open position cost</td><td class="num">${fmtMoney(pp.open_cost)}</td></tr>
+      <tr><td>Open/settled position value</td><td class="num">${fmtMoney(pp.open_value)}</td></tr>
+      <tr><td>Equity marked</td><td class="num">${fmtMoney(pp.equity)}</td></tr>
       <tr><td>Equity at cost</td><td class="num">${fmtMoney(pp.equity_at_cost)}</td></tr>
       <tr><td>Deployed notional</td><td class="num">${fmtMoney(pp.deployed_notional)}</td></tr>
       <tr><td>Sold notional</td><td class="num">${fmtMoney(pp.sold_notional)}</td></tr>
@@ -689,13 +741,18 @@ async function refresh() {
     : '<div class="empty">no executable paper decisions yet</div>';
 
   $("paperpositions").innerHTML = pp.positions.length ?
-    `<table><tr><th>token</th><th>market</th><th class="num">shares</th>
-       <th class="num">avg price</th><th class="num">cost</th></tr>` +
+    `<table><tr><th>token</th><th>market</th><th>status</th><th class="num">shares</th>
+       <th class="num">avg price</th><th class="num">mark</th>
+       <th class="num">cost</th><th class="num">value</th><th class="num">PnL</th></tr>` +
     pp.positions.map(p => `<tr><td>${extLink(p.url, short(p.token_id, 18), p.question || p.slug || p.token_id)}</td>
       <td>${extLink(p.url, short(p.market_id, 18), p.question || p.slug || p.market_id)}</td>
+      <td>${esc(p.status)}</td>
       <td class="num">${Number(p.size).toFixed(2)}</td>
       <td class="num">${Number(p.avg_price).toFixed(4)}</td>
-      <td class="num">${fmtMoney(p.cost)}</td></tr>`).join("") + `</table>`
+      <td class="num">${p.mark_price == null ? "—" : Number(p.mark_price).toFixed(4)}</td>
+      <td class="num">${fmtMoney(p.cost)}</td>
+      <td class="num">${fmtMoney(p.value)}</td>
+      <td class="num">${fmtMoney(p.pnl)}</td></tr>`).join("") + `</table>`
     : '<div class="empty">no open paper positions</div>';
 
   $("signals").innerHTML = s.signals.length ?
