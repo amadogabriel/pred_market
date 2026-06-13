@@ -26,6 +26,7 @@ from pm.core import db
 from pm.core.books import BookStore
 from pm.core.bus import Bus
 from pm.execution.fee_engine import FeeEngine
+from pm.execution.paper import paper_trader_task
 from pm.execution.task import execution_task
 from pm.ingestion.event_logger import event_logger_task
 from pm.ingestion.metadata_sync import metadata_sync_loop
@@ -98,6 +99,8 @@ async def main() -> None:
                            name="whale_scorer")
             tg.create_task(calibration_div_task(bus, conn, books, fee_engine, settings),
                            name="calibration")
+            tg.create_task(paper_trader_task(conn, books, fee_engine, settings),
+                           name="paper_trader")
             tg.create_task(ai_model_task(conn, settings),
                            name="ai_model")
             tg.create_task(heartbeat_task(conn, settings),

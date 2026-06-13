@@ -189,7 +189,59 @@ def query_state(conn, settings) -> dict:
         "counts": counts,
         "whale": whale,
         "strategies": strategies,
+        "paper": _paper_summary(conn),
     }
+
+
+def _paper_summary(conn) -> dict | None:
+    """Light read of the paper-trading account; None if it hasn't started."""
+    acct = conn.execute("SELECT bankroll, cash, realized_pnl, n_trades "
+                        "FROM paper_account WHERE id=1").fetchone() \
+        if _table_exists(conn, "paper_account") else None
+    if not acct:
+        return None
+    bankroll = float(acct["bankroll"] or 0.0)
+    cash = float(acct["cash"] or 0.0)
+    realized = float(acct["realized_pnl"] or 0.0)
+    # open positions: cost basis only (no live book here — the engine marks MTM;
+    # the dashboard shows realized + cost-held, which is conservative)
+    open_rows = conn.execute(
+        "SELECT COUNT(*) n, COALESCE(SUM(cost),0) cost "
+        "FROM paper_trades WHERE status='open'").fetchone()
+    n_open = int(open_rows["n"] or 0)
+    held_cost = float(open_rows["cost"] or 0.0)
+    closed = conn.execute(
+        "SELECT COUNT(*) n, SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END) wins "
+        "FROM paper_trades WHERE status IN ('closed','settled')").fetchone()
+    n_closed = int(closed["n"] or 0)
+    wins = int(closed["wins"] or 0)
+    per_strat = [dict(r) for r in conn.execute(
+        "SELECT strategy, COUNT(*) trades, COALESCE(SUM(pnl),0) pnl "
+        "FROM paper_trades WHERE status IN ('closed','settled') "
+        "GROUP BY strategy ORDER BY pnl")]
+    # equity approximation: cash + cost basis of open positions (marked at entry).
+    equity = cash + held_cost
+    return {
+        "bankroll": round(bankroll, 2),
+        "equity": round(equity, 2),
+        "cash": round(cash, 2),
+        "realized_pnl": round(realized, 2),
+        "return_pct": round((equity / bankroll - 1.0) * 100.0, 2) if bankroll else 0.0,
+        "n_open": n_open,
+        "n_closed": n_closed,
+        "n_trades": int(acct["n_trades"] or 0),
+        "win_rate": round(wins / n_closed, 3) if n_closed else None,
+        "per_strategy": per_strat,
+    }
+
+
+def _table_exists(conn, name: str) -> bool:
+    try:
+        return conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            (name,)).fetchone() is not None
+    except Exception:  # noqa: BLE001
+        return False
 
 
 async def handle_api(request: web.Request) -> web.Response:
@@ -267,6 +319,13 @@ PAGE = """<!doctype html>
 
   <div class="stat-row" id="stats"></div>
 
+  <h2>Paper trading <span style="font-weight:400;color:var(--muted);font-size:14px">— $100 of pretend money</span></h2>
+  <div class="card" id="paper">
+    <p class="status">Paper trading hasn't started yet.</p>
+  </div>
+  <p class="sub" style="margin:-4px 0 0;font-size:13px">Simulated only — no real money. Fills cross the
+    spread (buy high, sell low) and pay the real fee, so this is an honest test, not a flattering one.</p>
+
   <h2>What it's testing</h2>
   <div id="strategies"></div>
 
@@ -318,6 +377,26 @@ async function refresh(){
     ["Wallets found", num(d.whale.wallets)],
     ["Real trades", num(c.real_trades) + (c.real_trades===0 ? " · off" : "")],
   ].map(([l,v]) => `<div class="stat"><div class="v">${v}</div><div class="l">${l}</div></div>`).join("");
+
+  const p = d.paper;
+  if(p){
+    const pnlColor = p.realized_pnl >= 0 ? "var(--good)" : "#d4564f";
+    const retColor = p.return_pct >= 0 ? "var(--good)" : "#d4564f";
+    const sign = v => (v>=0?"+":"") + v.toFixed(2);
+    const perStrat = (p.per_strategy||[]).map(r =>
+      `<div class="comp"><span class="nm">${r.strategy}</span>
+        <span class="dt" style="color:${r.pnl>=0?'var(--good)':'#d4564f'}">${sign(r.pnl)} over ${r.trades} closed</span></div>`).join("")
+      || `<div class="status">No trades have closed yet.</div>`;
+    document.getElementById("paper").innerHTML = `
+      <div class="stat-row" style="margin:0 0 12px">
+        <div class="stat"><div class="v">$${p.equity.toFixed(2)}</div><div class="l">Account value</div></div>
+        <div class="stat"><div class="v" style="color:${retColor}">${(p.return_pct>=0?"+":"")}${p.return_pct.toFixed(1)}%</div><div class="l">Since $${p.bankroll.toFixed(0)} start</div></div>
+        <div class="stat"><div class="v" style="color:${pnlColor}">${sign(p.realized_pnl)}</div><div class="l">Booked profit/loss</div></div>
+        <div class="stat"><div class="v">${p.n_open}</div><div class="l">Open bets · ${p.n_trades} total</div></div>
+      </div>
+      <div style="font-size:13px;color:var(--muted);margin-bottom:6px">Booked profit/loss by strategy${p.win_rate!=null?" · win rate "+Math.round(p.win_rate*100)+"%":""}:</div>
+      ${perStrat}`;
+  }
 
   document.getElementById("strategies").innerHTML = d.strategies.map(s => `
     <div class="card">

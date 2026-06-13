@@ -138,6 +138,16 @@ class Settings:
     calibration_debounce_s: float = field(default_factory=lambda: float(_env("PM_CALIB_DEBOUNCE", "3600")))
     calibration_use_metaculus: bool = field(default_factory=lambda: _env_bool("PM_CALIB_METACULUS", "false"))
 
+    # --- paper trading (simulated money; never touches the real execution path) ---
+    paper_enabled: bool = field(default_factory=lambda: _env_bool("PM_PAPER_ENABLED", "true"))
+    paper_bankroll: float = field(default_factory=lambda: float(_env("PM_PAPER_BANKROLL", "100")))
+    paper_per_trade: float = field(default_factory=lambda: float(_env("PM_PAPER_PER_TRADE", "10")))
+    paper_hold_s: float = field(default_factory=lambda: float(_env("PM_PAPER_HOLD_S", "1800")))
+    paper_poll_s: float = field(default_factory=lambda: float(_env("PM_PAPER_POLL_S", "20")))
+    paper_strategies: str = field(default_factory=lambda: _env(
+        "PM_PAPER_STRATEGIES",
+        "struct_arb,whale_follow,news,microstructure,rel_value,momentum"))
+
     # --- Kelly sizing (applied when an executable signal converts to an intent) ---
     kelly_factor: float = field(default_factory=lambda: float(_env("PM_KELLY_FACTOR", "0.5")))
     kelly_per_trade_cap: float = field(default_factory=lambda: float(_env("PM_KELLY_PER_TRADE_CAP", "25")))
