@@ -70,6 +70,7 @@ async def calibration_div_task(bus: Bus, conn: sqlite3.Connection,
     log.info("calibration: %d base rates loaded, threshold=%.2f, ttm_min=%.0fs",
              len(rates), edge_threshold, min_ttm_s)
 
+    hb_interval = float(getattr(settings, "heartbeat_interval", 15))
     async with aiohttp.ClientSession(timeout=timeout) as session:
         while True:
             try:
@@ -78,8 +79,15 @@ async def calibration_div_task(bus: Bus, conn: sqlite3.Connection,
                     edge_threshold=edge_threshold, min_ttm_s=min_ttm_s,
                     use_metaculus=use_metaculus, debounce=debounce,
                     stale_after=stale_after, venue=venue)
-                beat(conn, "calibration", f"emitted={emitted}")
-                await asyncio.sleep(poll_s)
+                # Idle-beat between full passes so the monitor doesn't flag the
+                # task stale during the long (default 600s) poll interval.
+                slept = 0.0
+                while slept < poll_s:
+                    beat(conn, "calibration", f"emitted={emitted}; "
+                         f"next in ~{int(poll_s - slept)}s")
+                    nap = min(hb_interval, poll_s - slept)
+                    await asyncio.sleep(nap)
+                    slept += nap
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001
