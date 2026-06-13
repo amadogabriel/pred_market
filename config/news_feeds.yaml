@@ -1,0 +1,26 @@
+# Active news feeds for the S6 news-signal scanner.
+# Public RSS only. poll_s is the re-fetch cadence per feed (be polite).
+
+- name: bbc_world
+  url: http://feeds.bbci.co.uk/news/world/rss.xml
+  poll_s: 120
+
+- name: bbc_business
+  url: http://feeds.bbci.co.uk/news/business/rss.xml
+  poll_s: 180
+
+- name: bbc_politics
+  url: http://feeds.bbci.co.uk/news/politics/rss.xml
+  poll_s: 180
+
+- name: bbc_technology
+  url: http://feeds.bbci.co.uk/news/technology/rss.xml
+  poll_s: 240
+
+- name: federalreserve_press
+  url: https://www.federalreserve.gov/feeds/press_all.xml
+  poll_s: 600
+
+- name: reuters_markets_via_google
+  url: https://news.google.com/rss/search?q=when:24h+markets+OR+election+OR+fed&hl=en-US&gl=US&ceid=US:en
+  poll_s: 300

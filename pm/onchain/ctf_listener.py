@@ -58,10 +58,17 @@ async def ctf_listener_task(conn, bus: Bus, settings) -> None:
     poll_s = float(getattr(settings, "polygon_poll_s", 5.0))
     lookback = int(getattr(settings, "polygon_lookback_blocks", 50))
 
+    discovery = bool(getattr(settings, "whale_discovery", True))
+    discovery_floor = int(getattr(settings, "whale_discovery_value_raw", 500_000_000))
+    # The CTF contract is very active (~85 transfers/block). Keep each
+    # eth_getLogs window small so public nodes don't time out on the response.
+    max_span = int(getattr(settings, "polygon_max_block_span", 8))
+
     last_block: int | None = None
     backoff = 5.0
     async with PolygonRpc(settings.polygon_rpc_url) as rpc:
-        log.info("ctf_listener: watching %s every %.0fs", ctf_addr, poll_s)
+        log.info("ctf_listener: watching %s every %.0fs (discovery=%s, max_span=%d)",
+                 ctf_addr, poll_s, discovery, max_span)
         while True:
             try:
                 head = await rpc.block_number()
@@ -69,8 +76,22 @@ async def ctf_listener_task(conn, bus: Bus, settings) -> None:
                     last_block = max(0, head - lookback)
                 from_block = last_block + 1
                 if from_block <= head:
-                    await _scan_window(rpc, conn, bus, ctf_addr,
-                                       from_block, head)
+                    # Clamp a large gap so we never request a huge window; on a
+                    # tail-follower it's fine to skip old blocks at startup.
+                    if head - from_block > max_span:
+                        skipped = head - max_span - from_block
+                        log.info("ctf_listener: skipping %d old blocks to catch up",
+                                 skipped)
+                        from_block = head - max_span
+                    # Walk the window in <=max_span chunks
+                    cursor = from_block
+                    while cursor <= head:
+                        chunk_end = min(cursor + max_span - 1, head)
+                        await _scan_window(rpc, conn, bus, ctf_addr,
+                                           cursor, chunk_end,
+                                           discovery=discovery,
+                                           discovery_floor=discovery_floor)
+                        cursor = chunk_end + 1
                     last_block = head
                 beat(conn, "ctf_listener", f"head={head}")
                 backoff = 5.0
@@ -78,6 +99,9 @@ async def ctf_listener_task(conn, bus: Bus, settings) -> None:
             except asyncio.CancelledError:
                 raise
             except (RpcError, Exception) as e:  # noqa: BLE001
+                # Beat in the failure path too, with the error, so the monitor
+                # sees liveness and the cause instead of a silent stale flag.
+                beat(conn, "ctf_listener", f"error: {type(e).__name__}; retry {backoff:.0f}s")
                 log.warning("ctf_listener pass failed: %r; backing off %.0fs",
                             e, backoff)
                 await asyncio.sleep(backoff)
@@ -85,10 +109,18 @@ async def ctf_listener_task(conn, bus: Bus, settings) -> None:
 
 
 async def _scan_window(rpc: PolygonRpc, conn, bus: Bus, ctf_addr: str,
-                       from_block: int, to_block: int) -> None:
-    """Fetch + decode + persist tracked-wallet transfers in the block window."""
+                       from_block: int, to_block: int, *,
+                       discovery: bool = False,
+                       discovery_floor: int = 500_000_000) -> None:
+    """Fetch + decode + persist transfers in the block window.
+
+    Tracked wallets: recorded AND published as whale_transfer events (so the
+    signal scanner fires). Untracked wallets (discovery mode only): recorded
+    above discovery_floor to build the candidate pool, but NOT published — the
+    scorer promotes them to tracked later, after they accrue resolved bets.
+    """
     tracked = set(w.lower() for w in tracked_wallets(conn))
-    if not tracked:
+    if not tracked and not discovery:
         return
 
     flt = LogFilter(
@@ -110,32 +142,37 @@ async def _scan_window(rpc: PolygonRpc, conn, bus: Bus, ctf_addr: str,
         return
 
     market_lookup = _market_id_lookup(conn)
-    relevant = 0
+    published = 0
+    discovered = 0
     for t in transfers:
-        # Either side participating counts
-        sides = []
-        if t.from_addr.lower() in tracked:
-            sides.append(("SELL", t.from_addr))
-        if t.to_addr.lower() in tracked:
-            sides.append(("BUY", t.to_addr))
-        if not sides:
-            continue
         token_id_str = str(t.token_id)
         market_id = market_lookup.get(token_id_str)
-        for side, wallet in sides:
-            upsert_position(
-                conn, wallet=wallet, token_id=token_id_str,
-                market_id=market_id, side=side, value_raw=t.value,
-                tx_hash=t.tx_hash, block_number=t.block_number)
-            bus.publish(Event(T_SYSTEM, {
-                "what": "whale_transfer", "wallet": wallet,
-                "token_id": token_id_str, "market_id": market_id,
-                "side": side, "value_raw": t.value,
-                "tx_hash": t.tx_hash, "block": t.block_number}))
-            relevant += 1
-    if relevant:
-        log.info("ctf_listener: %d tracked transfers in blocks %d..%d",
-                 relevant, from_block, to_block)
+        # Each non-mint/burn transfer has a seller (from) and buyer (to).
+        for side, wallet in (("SELL", t.from_addr), ("BUY", t.to_addr)):
+            wl = wallet.lower()
+            is_tracked = wl in tracked
+            if is_tracked:
+                upsert_position(
+                    conn, wallet=wallet, token_id=token_id_str,
+                    market_id=market_id, side=side, value_raw=t.value,
+                    tx_hash=t.tx_hash, block_number=t.block_number)
+                bus.publish(Event(T_SYSTEM, {
+                    "what": "whale_transfer", "wallet": wl,
+                    "token_id": token_id_str, "market_id": market_id,
+                    "side": side, "value_raw": t.value,
+                    "tx_hash": t.tx_hash, "block": t.block_number}))
+                published += 1
+            elif discovery and not t.is_mint and not t.is_burn \
+                    and t.value >= discovery_floor:
+                # Build the candidate pool; the scorer promotes later. No publish.
+                upsert_position(
+                    conn, wallet=wallet, token_id=token_id_str,
+                    market_id=market_id, side=side, value_raw=t.value,
+                    tx_hash=t.tx_hash, block_number=t.block_number)
+                discovered += 1
+    if published or discovered:
+        log.info("ctf_listener: blocks %d..%d — %d tracked, %d discovered",
+                 from_block, to_block, published, discovered)
 
 
 def _market_id_lookup(conn) -> dict[str, str]:

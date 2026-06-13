@@ -20,6 +20,7 @@ import sys
 import time
 
 from config.settings import Settings
+from pm.ai.task import ai_model_task
 from pm.calibration.base_rates import load as load_base_rates
 from pm.core import db
 from pm.core.books import BookStore
@@ -33,6 +34,7 @@ from pm.ingestion.ws_polymarket import PolymarketWS
 from pm.news.rss import rss_poller_task
 from pm.onchain.ctf_listener import ctf_listener_task
 from pm.onchain.wallet_tracker import ensure_schema as ensure_whale_schema
+from pm.onchain.whale_scorer import whale_scorer_task
 from pm.signals.calibration_div import calibration_div_task
 from pm.signals.labeler import labeler_task
 from pm.signals.scan_task import scan_task
@@ -92,8 +94,12 @@ async def main() -> None:
                            name="rss_poller")
             tg.create_task(ctf_listener_task(conn, bus, settings),
                            name="ctf_listener")
+            tg.create_task(whale_scorer_task(conn, settings),
+                           name="whale_scorer")
             tg.create_task(calibration_div_task(bus, conn, books, fee_engine, settings),
                            name="calibration")
+            tg.create_task(ai_model_task(conn, settings),
+                           name="ai_model")
             tg.create_task(heartbeat_task(conn, settings),
                            name="heartbeat")
     finally:

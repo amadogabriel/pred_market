@@ -107,11 +107,19 @@ class Settings:
     polygon_ctf_address: str = field(default_factory=lambda: _env(
         "PM_POLYGON_CTF_ADDRESS", "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"))
     polygon_poll_s: float = field(default_factory=lambda: float(_env("PM_POLYGON_POLL_S", "5")))
-    polygon_lookback_blocks: int = field(default_factory=lambda: int(_env("PM_POLYGON_LOOKBACK_BLOCKS", "50")))
+    polygon_lookback_blocks: int = field(default_factory=lambda: int(_env("PM_POLYGON_LOOKBACK_BLOCKS", "8")))
+    polygon_max_block_span: int = field(default_factory=lambda: int(_env("PM_POLYGON_MAX_BLOCK_SPAN", "8")))
     whale_min_calibration: float = field(default_factory=lambda: float(_env("PM_WHALE_MIN_CALIB", "0.55")))
     whale_min_resolved: int = field(default_factory=lambda: int(_env("PM_WHALE_MIN_RESOLVED", "5")))
     whale_min_value_raw: int = field(default_factory=lambda: int(_env("PM_WHALE_MIN_VALUE_RAW", "100000000")))
     whale_debounce_s: float = field(default_factory=lambda: float(_env("PM_WHALE_DEBOUNCE", "60")))
+    # discovery: record large positions from ANY wallet to build a candidate pool
+    whale_discovery: bool = field(default_factory=lambda: _env_bool("PM_WHALE_DISCOVERY", "true"))
+    whale_discovery_value_raw: int = field(default_factory=lambda: int(_env("PM_WHALE_DISCOVERY_VALUE_RAW", "500000000")))
+    # scorer: resolve discovered positions and auto-promote winners to tracked
+    whale_score_poll_s: float = field(default_factory=lambda: float(_env("PM_WHALE_SCORE_POLL", "600")))
+    whale_promote_calibration: float = field(default_factory=lambda: float(_env("PM_WHALE_PROMOTE_CALIB", "0.60")))
+    whale_promote_min_resolved: int = field(default_factory=lambda: int(_env("PM_WHALE_PROMOTE_MIN_RESOLVED", "8")))
 
     # --- news (S6 research; RSS poller + headline matcher; never executable) ---
     news_feeds_yaml: Path = field(default_factory=lambda: Path(_env(
@@ -135,6 +143,12 @@ class Settings:
     kelly_per_trade_cap: float = field(default_factory=lambda: float(_env("PM_KELLY_PER_TRADE_CAP", "25")))
     kelly_ttm_cliff_s: float = field(default_factory=lambda: float(_env("PM_KELLY_TTM_CLIFF", "259200")))
     kelly_ttm_floor: float = field(default_factory=lambda: float(_env("PM_KELLY_TTM_FLOOR", "0.25")))
+
+    # --- local AI meta-label model (research triage; never submits orders) ---
+    ai_model_path: Path = field(default_factory=lambda: Path(_env(
+        "PM_AI_MODEL_PATH", str(ROOT / "data" / "ai_model.json"))))
+    ai_min_train_samples: int = field(default_factory=lambda: int(_env("PM_AI_MIN_SAMPLES", "50")))
+    ai_train_interval_s: float = field(default_factory=lambda: float(_env("PM_AI_TRAIN_INTERVAL", "900")))
 
     # --- telegram (monitor process) ---
     telegram_token: str = field(default_factory=lambda: _env("PM_TG_TOKEN", ""))
