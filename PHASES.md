@@ -29,6 +29,12 @@ Status: implemented (signal capture only; never executable).
 - S4 momentum (`pm/signals/momentum.py`): directional_momentum (z-scored
   drift against own per-step vol), boundary_overshoot (extreme price +
   interior-direction bounce)
+- S5 whale-follow (`pm/signals/whale_follow.py`): tracked_wallet_position
+  driven by on-chain CTF transfers via `pm.onchain`
+- S6 news (`pm/signals/news_signal.py`): headline_match via RSS poller +
+  keyword/entity matcher + Bayesian update against current mid
+- S7 calibration (`pm/signals/calibration_div.py`): model_divergence from
+  internal base rates blended with optional Metaculus crowd forecasts
 - Outcome labeler (`pm/signals/labeler.py`): fills signal_log.outcome/pnl
   with forward mid returns after PM_LABEL_HORIZON
 - Offline replay harness (`scripts/replay_signals.py`): re-runs the scanners

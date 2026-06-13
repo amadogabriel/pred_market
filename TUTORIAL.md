@@ -152,6 +152,38 @@ The four strategies and their kinds:
 | `rel_value` | `complement_drift` | YES_mid + NO_mid drifted from 1.0 beyond fees | research only |
 | `momentum` | `directional_momentum` | sustained signed mid drift, z-scored vs own vol | research only |
 | `momentum` | `boundary_overshoot` | YES pinned beyond 0.95 / 0.05 then bounced inward | research only |
+| `whale_follow` | `tracked_wallet_position` | tracked Polymarket wallet (calibration above baseline) takes new on-chain position | research only |
+| `news` | `headline_match` | RSS headline matches a tracked market and Bayesian update exceeds the edge threshold | research only |
+| `calibration` | `model_divergence` | market mid diverges from internal-base-rate + Metaculus blended model by ≥ threshold | research only |
+
+### Optional integrations (not required for the core engine)
+
+The whale-follow, news, and calibration strategies all *idle* if their
+external dependency is not configured:
+
+- **Whale-follow** needs `PM_POLYGON_RPC_URL` (any Polygon JSON-RPC
+  endpoint — Alchemy, Infura free tier, public node). Empty URL → the
+  `ctf_listener` task logs and idles; everything else keeps running.
+  You also need to mark wallets you care about with
+  `python scripts/inspect_state.py` or by direct SQL on the `whale_wallets`
+  table; the listener watches transfers involving those wallets only.
+
+- **News** needs `config/news_feeds.yaml` (copy from `news_feeds.yaml.example`).
+  Empty file → the `rss_poller` task idles.
+
+- **Calibration** needs `config/base_rates.yaml` (an example is shipped).
+  Edit base rates as you gather resolved samples. Set
+  `PM_CALIB_METACULUS=true` to additionally blend in Metaculus public-API
+  forecasts (no auth required).
+
+### What we intentionally did NOT build
+
+The strategy report (`STRATEGY_BRIEF.md`) describes a four-strategy framework
+that included **cross-platform arbitrage between Kalshi and Polymarket**.
+That strategy is intentionally not built — adding Kalshi would more than
+double the integration surface and the user explicitly opted out. The other
+three strategies (whale-follow, news, calibration) are built and structurally
+fail-closed.
 
 Each signal in `signal_log` carries a `legs_json` (which tokens, at what price,
 which side) and a `features_json` (the scanner's own diagnostics — z-score,

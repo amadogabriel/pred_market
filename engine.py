@@ -20,6 +20,7 @@ import sys
 import time
 
 from config.settings import Settings
+from pm.calibration.base_rates import load as load_base_rates
 from pm.core import db
 from pm.core.books import BookStore
 from pm.core.bus import Bus
@@ -29,6 +30,10 @@ from pm.ingestion.event_logger import event_logger_task
 from pm.ingestion.metadata_sync import metadata_sync_loop
 from pm.ingestion.rest_recon import recon_task
 from pm.ingestion.ws_polymarket import PolymarketWS
+from pm.news.rss import rss_poller_task
+from pm.onchain.ctf_listener import ctf_listener_task
+from pm.onchain.wallet_tracker import ensure_schema as ensure_whale_schema
+from pm.signals.calibration_div import calibration_div_task
 from pm.signals.labeler import labeler_task
 from pm.signals.scan_task import scan_task
 
@@ -59,6 +64,7 @@ async def main() -> None:
     settings = Settings()
     log.info("pm-system engine starting (LIVE_TRADING=%s)", LIVE_TRADING)
     conn = db.connect(settings.db_path)
+    ensure_whale_schema(conn)
     bus = Bus()
     books = BookStore()
     fee_engine = FeeEngine.from_yaml(settings.fees_yaml)
@@ -82,6 +88,12 @@ async def main() -> None:
                            name="execution")
             tg.create_task(labeler_task(conn, books, settings),
                            name="labeler")
+            tg.create_task(rss_poller_task(bus, conn, settings),
+                           name="rss_poller")
+            tg.create_task(ctf_listener_task(conn, bus, settings),
+                           name="ctf_listener")
+            tg.create_task(calibration_div_task(bus, conn, books, fee_engine, settings),
+                           name="calibration")
             tg.create_task(heartbeat_task(conn, settings),
                            name="heartbeat")
     finally:

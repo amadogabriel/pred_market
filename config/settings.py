@@ -102,6 +102,40 @@ class Settings:
     execution_strategies: frozenset[str] = field(default_factory=lambda: frozenset(
         s.strip() for s in _env("PM_EXECUTION_STRATEGIES", "struct_arb").split(",") if s.strip()))
 
+    # --- whale-follow (S5 research; on-chain Polygon listener; never executable) ---
+    polygon_rpc_url: str = field(default_factory=lambda: _env("PM_POLYGON_RPC_URL", ""))
+    polygon_ctf_address: str = field(default_factory=lambda: _env(
+        "PM_POLYGON_CTF_ADDRESS", "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"))
+    polygon_poll_s: float = field(default_factory=lambda: float(_env("PM_POLYGON_POLL_S", "5")))
+    polygon_lookback_blocks: int = field(default_factory=lambda: int(_env("PM_POLYGON_LOOKBACK_BLOCKS", "50")))
+    whale_min_calibration: float = field(default_factory=lambda: float(_env("PM_WHALE_MIN_CALIB", "0.55")))
+    whale_min_resolved: int = field(default_factory=lambda: int(_env("PM_WHALE_MIN_RESOLVED", "5")))
+    whale_min_value_raw: int = field(default_factory=lambda: int(_env("PM_WHALE_MIN_VALUE_RAW", "100000000")))
+    whale_debounce_s: float = field(default_factory=lambda: float(_env("PM_WHALE_DEBOUNCE", "60")))
+
+    # --- news (S6 research; RSS poller + headline matcher; never executable) ---
+    news_feeds_yaml: Path = field(default_factory=lambda: Path(_env(
+        "PM_NEWS_FEEDS_YAML", str(ROOT / "config" / "news_feeds.yaml"))))
+    news_min_overlap: int = field(default_factory=lambda: int(_env("PM_NEWS_MIN_OVERLAP", "2")))
+    news_top_k: int = field(default_factory=lambda: int(_env("PM_NEWS_TOP_K", "3")))
+    news_debounce_s: float = field(default_factory=lambda: float(_env("PM_NEWS_DEBOUNCE", "300")))
+    news_index_refresh_s: float = field(default_factory=lambda: float(_env("PM_NEWS_INDEX_REFRESH", "300")))
+
+    # --- calibration model (S7 research; periodic divergence; never executable) ---
+    base_rates_yaml: Path = field(default_factory=lambda: Path(_env(
+        "PM_BASE_RATES_YAML", str(ROOT / "config" / "base_rates.yaml"))))
+    calibration_edge_threshold: float = field(default_factory=lambda: float(_env("PM_CALIB_EDGE", "0.10")))
+    calibration_min_ttm_s: float = field(default_factory=lambda: float(_env("PM_CALIB_MIN_TTM", "86400")))
+    calibration_poll_s: float = field(default_factory=lambda: float(_env("PM_CALIB_POLL", "600")))
+    calibration_debounce_s: float = field(default_factory=lambda: float(_env("PM_CALIB_DEBOUNCE", "3600")))
+    calibration_use_metaculus: bool = field(default_factory=lambda: _env_bool("PM_CALIB_METACULUS", "false"))
+
+    # --- Kelly sizing (applied when an executable signal converts to an intent) ---
+    kelly_factor: float = field(default_factory=lambda: float(_env("PM_KELLY_FACTOR", "0.5")))
+    kelly_per_trade_cap: float = field(default_factory=lambda: float(_env("PM_KELLY_PER_TRADE_CAP", "25")))
+    kelly_ttm_cliff_s: float = field(default_factory=lambda: float(_env("PM_KELLY_TTM_CLIFF", "259200")))
+    kelly_ttm_floor: float = field(default_factory=lambda: float(_env("PM_KELLY_TTM_FLOOR", "0.25")))
+
     # --- telegram (monitor process) ---
     telegram_token: str = field(default_factory=lambda: _env("PM_TG_TOKEN", ""))
     telegram_chat_id: str = field(default_factory=lambda: _env("PM_TG_CHAT", ""))

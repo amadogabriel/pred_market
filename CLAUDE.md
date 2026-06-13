@@ -218,6 +218,24 @@ dataset; promote one to executable only after labeler validation + review.
   full window, then a meaningful interior-direction bounce in the latest
   sample. The classic "extreme price + initial reversion" setup.
 
+`pm/signals/whale_follow.py` (strategy `whale_follow`):
+- `tracked_wallet_position` — emitted when a wallet on the follow list (with
+  sustained calibration above baseline on resolved markets) takes a new
+  position large enough to clear the value floor. Sourced from `pm.onchain`
+  CTF events on Polygon (read-only JSON-RPC, no signing).
+
+`pm/signals/news_signal.py` (strategy `news`):
+- `headline_match` — emitted when an RSS-ingested article shares enough rare
+  tokens with a tracked market question AND has clear polarity. The
+  Bayesian update against current mid sets the encoded direction; signal
+  fires only if the implied edge exceeds the fee-aware threshold.
+
+`pm/signals/calibration_div.py` (strategy `calibration`):
+- `model_divergence` — emitted on a periodic (10-min) pass when the
+  market mid diverges by ≥ threshold from a model probability blended
+  from internal base rates (`config/base_rates.yaml`) and optionally
+  Metaculus crowd forecasts.
+
 `pm/signals/labeler.py` — fills `signal_log.outcome/pnl` with forward mid
 returns `PM_LABEL_HORIZON` (default 900s) after each signal. Outcome is signed
 per leg (BUY: mid_now − price; SELL: inverse) and averaged. This is what turns
@@ -246,6 +264,13 @@ research signal.
 | `pm/signals/microstructure.py` | ✅ done — S2 research signals (OFI, liquidity, trade-through) |
 | `pm/signals/relative_value.py` | ✅ done — S3 research signals (partition/complement drift) |
 | `pm/signals/momentum.py` | ✅ done — S4 research signals (directional drift, boundary overshoot) |
+| `pm/signals/whale_follow.py` | ✅ done — S5 on-chain wallet-follow research signals |
+| `pm/signals/news_signal.py` | ✅ done — S6 RSS-headline-matched research signals |
+| `pm/signals/calibration_div.py` | ✅ done — S7 base-rate-model divergence signals |
+| `pm/onchain/` | ✅ done — Polygon JSON-RPC + CTF decoder + wallet tracker |
+| `pm/news/` | ✅ done — RSS poller + keyword matcher + Bayesian update |
+| `pm/calibration/` | ✅ done — base-rate YAML + Metaculus fetcher + blend |
+| `pm/execution/sizing.py` | ✅ done — half-Kelly sizing + time-to-expiry haircut |
 | `pm/signals/labeler.py` | ✅ done — forward-return outcome labeler |
 | `engine.py` | ✅ done — live-run verified |
 | `monitor.py` | ✅ done — stale-heartbeat alert verified |

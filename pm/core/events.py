@@ -16,8 +16,10 @@ T_MARKET_EVT = "market_event"    # new_market / market_resolved / best_bid_ask
 T_SIGNAL = "signal"
 T_EXECUTION = "execution"        # execution intents, risk decisions, fills
 T_SYSTEM = "system"              # connects, disconnects, recon results, errors
+T_NEWS = "news_article"          # ingested RSS / news articles from rss_poller
 
-ALL_TOPICS = (T_BOOK, T_PRICE_CHANGE, T_TRADE, T_TICK, T_MARKET_EVT, T_SIGNAL, T_EXECUTION, T_SYSTEM)
+ALL_TOPICS = (T_BOOK, T_PRICE_CHANGE, T_TRADE, T_TICK, T_MARKET_EVT,
+              T_SIGNAL, T_EXECUTION, T_SYSTEM, T_NEWS)
 
 
 @dataclass

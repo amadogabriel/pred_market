@@ -24,13 +24,15 @@ import time
 
 from pm.core.bus import Bus
 from pm.core.db import beat, log_signal
-from pm.core.events import Event, T_BOOK, T_PRICE_CHANGE, T_SIGNAL, T_TRADE
+from pm.core.events import Event, T_BOOK, T_NEWS, T_PRICE_CHANGE, T_SIGNAL, T_SYSTEM, T_TRADE
 from pm.execution.fee_engine import FeeEngine
 from pm.signals.common import ResearchSignal
 from pm.signals.microstructure import MicrostructureTracker
 from pm.signals.momentum import MomentumTracker
+from pm.signals.news_signal import NewsSignalScanner
 from pm.signals.relative_value import RelativeValueMonitor
 from pm.signals.struct_arb import ArbSignal, StructArbScanner
+from pm.signals.whale_follow import WhaleFollowTracker
 
 log = logging.getLogger(__name__)
 
@@ -129,7 +131,22 @@ async def scan_task(bus: Bus, conn, books, fee_engine: FeeEngine, settings,
             boundary_bounce=settings.mom_boundary_bounce,
             debounce_s=settings.mom_debounce_s, stale_after=settings.stale_book_after)
 
-    queue = bus.subscribe(T_BOOK, T_PRICE_CHANGE, T_TRADE)
+    whale = WhaleFollowTracker(
+        books=books, fees=fee_engine, conn=conn,
+        debounce_s=settings.whale_debounce_s,
+        min_calibration=settings.whale_min_calibration,
+        min_resolved=settings.whale_min_resolved,
+        min_value_raw=settings.whale_min_value_raw,
+        stale_after=settings.stale_book_after)
+    news = NewsSignalScanner(
+        books=books, fees=fee_engine, conn=conn,
+        debounce_s=settings.news_debounce_s,
+        min_overlap=settings.news_min_overlap,
+        top_k=settings.news_top_k,
+        index_refresh_s=settings.news_index_refresh_s,
+        stale_after=settings.stale_book_after)
+
+    queue = bus.subscribe(T_BOOK, T_PRICE_CHANGE, T_TRADE, T_NEWS, T_SYSTEM)
 
     index = _load_market_index(conn)
     last_index = time.time()
@@ -150,16 +167,23 @@ async def scan_task(bus: Bus, conn, books, fee_engine: FeeEngine, settings,
 
         if event is not None:
             try:
-                asset_id = event.payload.get("asset_id")
-                meta = index.get(asset_id) if asset_id else None
-                if meta is not None:
-                    if event.topic == T_TRADE:
-                        if micro is not None:
-                            _persist_research(conn, bus,
-                                              micro.on_trade(event.payload, meta))
-                    else:
-                        _scan_book_update(conn, bus, scanner, micro, rv, mom,
-                                          asset_id, meta, neg_risk_groups)
+                if event.topic == T_NEWS:
+                    _persist_research(conn, bus, news.on_article(event.payload))
+                elif event.topic == T_SYSTEM:
+                    if event.payload.get("what") == "whale_transfer":
+                        _persist_research(conn, bus,
+                                          whale.on_whale_transfer(event.payload))
+                else:
+                    asset_id = event.payload.get("asset_id")
+                    meta = index.get(asset_id) if asset_id else None
+                    if meta is not None:
+                        if event.topic == T_TRADE:
+                            if micro is not None:
+                                _persist_research(conn, bus,
+                                                  micro.on_trade(event.payload, meta))
+                        else:
+                            _scan_book_update(conn, bus, scanner, micro, rv, mom,
+                                              asset_id, meta, neg_risk_groups)
             except Exception:  # noqa: BLE001 — one bad event must not kill the scanner
                 log.exception("scan failed for event %r", event.topic)
 

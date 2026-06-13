@@ -1,0 +1,27 @@
+# Copy to config/news_feeds.yaml (gitignored) and edit.
+# Empty file = news ingestion disabled (the rss_poller logs and exits the loop
+# in idle mode, so the rest of the engine is unaffected).
+#
+# poll_s is how often to re-fetch each feed. Be polite — many news sites
+# rate-limit or block aggressive polling. 60–300s is a sane range.
+#
+# Add only feeds you have permission to consume programmatically. Reuters,
+# AP, BBC, and most major outlets publish public RSS. X (Twitter) is not RSS
+# and is not supported by this poller — adding an X listener is a separate
+# module that emits the same news_article events to the bus.
+
+- name: bbc_world
+  url: http://feeds.bbci.co.uk/news/world/rss.xml
+  poll_s: 120
+
+- name: bbc_business
+  url: http://feeds.bbci.co.uk/news/business/rss.xml
+  poll_s: 180
+
+- name: ap_top
+  url: https://feeds.apnews.com/rss/apf-topnews
+  poll_s: 120
+
+- name: federalreserve_press
+  url: https://www.federalreserve.gov/feeds/press_all.xml
+  poll_s: 600

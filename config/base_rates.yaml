@@ -1,0 +1,51 @@
+# Hand-curated historical base rates for the calibration model.
+#
+# Each entry maps a market question (regex) to an empirical base-rate
+# probability with provenance. Edit when you find a new category with enough
+# resolved samples to justify a rate. n_samples = 0 means "informed prior,
+# not enough data" — the calibration scanner won't act on these alone.
+#
+# DO NOT add a base rate without a source citation. The whole point of this
+# file is auditability. If you can't cite where the number comes from, it's
+# noise.
+
+base_rates:
+  - name: fed_holds_rate
+    category: finance
+    question_pattern: "Fed (holds|keeps|maintains).*rate"
+    p: 0.55
+    n_samples: 0
+    source: "FOMC meeting history 2010-2025 (placeholder; verify)"
+    notes: "Holds are the modal outcome but the rate depends heavily on regime. Treat as informed prior only."
+
+  - name: incumbent_president_reelect
+    category: politics
+    question_pattern: "incumbent.*(wins|re.?elect|second.?term)"
+    p: 0.65
+    n_samples: 0
+    source: "Post-WW2 US presidential elections (placeholder)"
+    notes: "Incumbency advantage is ~65% post-WW2 in two-party races. Cite source before relying."
+
+  - name: btc_above_threshold_eoy
+    category: crypto
+    question_pattern: "Bitcoin.*\\$[0-9]+k.*end of"
+    p: 0.30
+    n_samples: 0
+    source: "End-of-year BTC threshold markets historical resolution rate"
+    notes: "Placeholder. Most $-threshold predictions miss the level."
+
+  - name: ai_model_release_quarter
+    category: tech
+    question_pattern: "(release|launch|announce).*(GPT|Claude|Gemini|Llama).*(Q[1-4]|quarter|by [A-Z])"
+    p: 0.55
+    n_samples: 0
+    source: "Recent frontier-model release cadence (informal)"
+    notes: "Companies usually meet their stated quarter but slip within it."
+
+  - name: ceasefire_signed_specific_window
+    category: geopolitics
+    question_pattern: "(ceasefire|truce|peace deal).*(signed|agreed).*by"
+    p: 0.12
+    n_samples: 0
+    source: "Negotiation base rate for short-window ceasefire predictions"
+    notes: "Ceasefires are rare on short timelines. Strong prior toward NO."
